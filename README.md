@@ -172,11 +172,12 @@ make LAUNCH_BROWSER=0                 # don't open the PS5 browser on start
 
 ### Making a release
 
-Push a version tag and GitHub Actions builds the payload from source and
-publishes the release, with notes from `docs/releases/<tag>.md`:
+Push a version tag (or run the *Release* workflow from the Actions tab with
+the tag name) and GitHub Actions builds the payload from source with the PS5
+SDK and publishes the release, with notes from `docs/releases/<tag>.md`:
 
 ```sh
-git tag v1.1.0 && git push origin v1.1.0
+git tag v1.2.0 && git push origin v1.2.0
 ```
 
 ### Desktop build (for development)
