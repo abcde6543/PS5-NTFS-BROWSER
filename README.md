@@ -109,8 +109,9 @@ automatically. Files and folders become readable and writable by everyone.
 
 ## Install and run
 
-1. Get `ntfs-browser.elf` (build it as described below, or use the prebuilt
-   file in this folder).
+1. Get `ntfs-browser.elf` from the
+   [latest release](https://github.com/abcde6543/PS5-NTFS-BROWSER/releases/latest)
+   (or build it as described below).
 2. Run your jailbreak so the ELF loader is listening.
 3. Send the payload, using one of these:
    ```sh
@@ -167,6 +168,15 @@ make                                  # -> ntfs-browser.elf
 make PS5_PAYLOAD_SDK=/path/to/sdk     # SDK elsewhere
 make PORT=9090                        # different HTTP port (default 8085)
 make LAUNCH_BROWSER=0                 # don't open the PS5 browser on start
+```
+
+### Making a release
+
+Push a version tag and GitHub Actions builds the payload from source and
+publishes the release, with notes from `docs/releases/<tag>.md`:
+
+```sh
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 ### Desktop build (for development)
