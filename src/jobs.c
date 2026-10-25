@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -30,11 +31,13 @@ typedef struct job {
   int      id;
   jstate_t state;
   char     vol[16];
+  char     dvol[16];     /* destination volume */
   char     src[1024];
   char     dest[1024];
   char     current[1024];
   char     error[256];
   uint64_t total_bytes, done_bytes;
+  uint64_t present_bytes; /* already at the destination (resume) */
   uint32_t total_files, done_files, skipped_files;
   int64_t  started, finished;
   volatile int cancel;
@@ -74,41 +77,70 @@ static int join(char *out, size_t outlen, const char *a, const char *b) {
   return n < 0 || (size_t)n >= outlen ? -1 : 0;
 }
 
-/* Some names that are fine on NTFS are not allowed on exFAT USB drives. */
+/* Make a name valid for Windows-style file systems (NTFS written by us,
+ * exFAT/FAT USB drives): no \\ : * ? " < > |, no control characters, no
+ * trailing dot or space, and not a reserved device name such as CON. */
 static void safe_name(char *dst, size_t len, const char *src) {
-  snprintf(dst, len, "%s", src);
-  for (char *p = dst; *p; p++)
+  static const char *reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
+                                   "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                                   "LPT7", "LPT8", "LPT9"};
+  char tmp[1024];
+  snprintf(tmp, sizeof tmp, "%s", src);
+  for (char *p = tmp; *p; p++)
     if (strchr("\\:*?\"<>|", *p) || (unsigned char)*p < 0x20) *p = '_';
+  size_t n = strlen(tmp);
+  while (n && (tmp[n - 1] == '.' || tmp[n - 1] == ' ')) tmp[--n] = '_';
+  if (!n) snprintf(tmp, sizeof tmp, "_");
+  char stem[16];
+  size_t sl = strcspn(tmp, ".");
+  if (sl < sizeof stem) {
+    memcpy(stem, tmp, sl);
+    stem[sl] = 0;
+    for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++)
+      if (!strcasecmp(stem, reserved[i])) {
+        snprintf(dst, len, "_%s", tmp);
+        return;
+      }
+  }
+  snprintf(dst, len, "%s", tmp);
 }
 
 /* ---- Scan ---------------------------------------------------------------- */
 
-static int scan(job_t *j, vol_t *v, const char *path, int depth) {
+/* Count what will be copied. dst mirrors the destination path so data that
+ * is already there (an earlier, interrupted copy) is not counted as needed
+ * space. */
+static void count_file(job_t *j, vol_t *dv, const char *dst, uint64_t size) {
+  ventry_t ds;
+  int present = dst && vfs_stat(dv, dst, &ds) == 0 && !ds.is_dir && ds.size == size;
+  pthread_mutex_lock(&g_lock);
+  j->total_bytes += size;
+  j->total_files++;
+  if (present) j->present_bytes += size;
+  pthread_mutex_unlock(&g_lock);
+}
+
+static int scan(job_t *j, vol_t *v, vol_t *dv, const char *path, const char *dst, int depth) {
   if (j->cancel) return -ECANCELED;
   if (depth > 64) return -ELOOP;
   ventry_t st;
   int rc = vfs_stat(v, path, &st);
   if (rc) { fail(j, "cannot read %s", path, -rc); return rc; }
   if (!st.is_dir) {
-    pthread_mutex_lock(&g_lock);
-    j->total_bytes += st.size;
-    j->total_files++;
-    pthread_mutex_unlock(&g_lock);
+    count_file(j, dv, dst, st.size);
     return 0;
   }
   vlist_t l;
   if ((rc = vfs_list(v, path, &l))) { fail(j, "cannot list %s", path, -rc); return rc; }
-  char child[2048];
+  char child[2048], dchild[2048], nm[1024];
   for (size_t i = 0; i < l.n && !rc; i++) {
     if (l.e[i].is_link && l.e[i].is_dir) continue; /* junctions: avoid loops */
     if (join(child, sizeof child, path, l.e[i].name)) continue;
-    if (l.e[i].is_dir) rc = scan(j, v, child, depth + 1);
-    else {
-      pthread_mutex_lock(&g_lock);
-      j->total_bytes += l.e[i].size;
-      j->total_files++;
-      pthread_mutex_unlock(&g_lock);
-    }
+    safe_name(nm, sizeof nm, l.e[i].name);
+    int have_dst = dst && !join(dchild, sizeof dchild, dst, nm);
+    if (l.e[i].is_dir) rc = scan(j, v, dv, child, have_dst ? dchild : NULL, depth + 1);
+    else count_file(j, dv, have_dst ? dchild : NULL, l.e[i].size);
   }
   vfs_list_free(&l);
   return rc;
@@ -116,8 +148,8 @@ static int scan(job_t *j, vol_t *v, const char *path, int depth) {
 
 /* ---- Copy ---------------------------------------------------------------- */
 
-static int copy_file(job_t *j, vol_t *v, const char *src, const char *dst,
-                     int64_t mtime, uint8_t *buf) {
+static int copy_file(job_t *j, vol_t *v, vol_t *dv, const char *src,
+                     const char *dst, int64_t mtime, uint8_t *buf) {
   pthread_mutex_lock(&g_lock);
   snprintf(j->current, sizeof j->current, "%s", src);
   pthread_mutex_unlock(&g_lock);
@@ -126,9 +158,18 @@ static int copy_file(job_t *j, vol_t *v, const char *src, const char *dst,
   int rc = vfs_open(v, src, &f);
   if (rc) { fail(j, "cannot open %s", src, -rc); return rc; }
 
-  /* Resume support: an existing file with the same size is skipped. */
-  struct stat ds;
-  if (stat(dst, &ds) == 0 && S_ISREG(ds.st_mode) && (uint64_t)ds.st_size == f.size) {
+  vwfile_t w;
+  uint64_t done = 0;
+  rc = vfs_wopen(dv, dst, f.size, mtime, &w, &done);
+  if (rc) {
+    fail(j, rc == -EEXIST ? "a different file already exists at %s" : "cannot create %s",
+         dst, rc == -EEXIST ? 0 : -rc);
+    vfs_close(&f);
+    return rc;
+  }
+  if (done >= f.size) {
+    /* Already there (resume). */
+    vfs_wclose(&w, 1);
     vfs_close(&f);
     pthread_mutex_lock(&g_lock);
     j->done_bytes += f.size;
@@ -137,18 +178,11 @@ static int copy_file(job_t *j, vol_t *v, const char *src, const char *dst,
     pthread_mutex_unlock(&g_lock);
     return 0;
   }
+  pthread_mutex_lock(&g_lock);
+  j->done_bytes += done; /* continuing a partly copied file */
+  pthread_mutex_unlock(&g_lock);
 
-  char tmp[2100];
-  snprintf(tmp, sizeof tmp, "%s.part", dst);
-  int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (out < 0) {
-    rc = -errno;
-    fail(j, "cannot create %s", tmp, -rc);
-    vfs_close(&f);
-    return rc;
-  }
-
-  uint64_t off = 0;
+  uint64_t off = done;
   while (off < f.size) {
     if (j->cancel) { rc = -ECANCELED; break; }
     size_t want = f.size - off < COPY_BUF ? (size_t)(f.size - off) : COPY_BUF;
@@ -158,57 +192,42 @@ static int copy_file(job_t *j, vol_t *v, const char *src, const char *dst,
       fail(j, "read error in %s", src, -rc);
       break;
     }
-    for (ssize_t w = 0; w < n;) {
-      ssize_t m = write(out, buf + w, (size_t)(n - w));
-      if (m < 0) {
-        if (errno == EINTR) continue;
-        rc = -errno;
-        fail(j, "write error in %s", dst, -rc);
-        break;
-      }
-      w += m;
-    }
-    if (rc) break;
+    rc = vfs_wwrite(&w, buf, (size_t)n);
+    if (rc) { fail(j, "write error in %s", dst, -rc); break; }
     off += (uint64_t)n;
     pthread_mutex_lock(&g_lock);
     j->done_bytes += (uint64_t)n;
     pthread_mutex_unlock(&g_lock);
   }
   vfs_close(&f);
-  if (close(out) && !rc) { rc = -errno; fail(j, "write error in %s", dst, -rc); }
-
-  if (rc) {
-    unlink(tmp);
-    return rc;
-  }
-  if (rename(tmp, dst)) {
-    rc = -errno;
-    fail(j, "cannot rename to %s", dst, -rc);
-    unlink(tmp);
-    return rc;
-  }
-  if (mtime > 0) {
-    struct timeval tv[2] = {{(time_t)mtime, 0}, {(time_t)mtime, 0}};
-    utimes(dst, tv);
-  }
+  int rc2 = vfs_wclose(&w, rc == 0);
+  if (!rc && rc2) { rc = rc2; fail(j, "cannot finish %s", dst, -rc); }
+  if (rc) return rc;
   pthread_mutex_lock(&g_lock);
   j->done_files++;
   pthread_mutex_unlock(&g_lock);
   return 0;
 }
 
-static int copy_tree(job_t *j, vol_t *v, const char *src, const char *dst,
+static int copy_tree(job_t *j, vol_t *v, vol_t *dv, const char *src, const char *dst,
                      uint8_t *buf, int depth) {
   if (j->cancel) return -ECANCELED;
   if (depth > 64) return -ELOOP;
   ventry_t st;
   int rc = vfs_stat(v, src, &st);
   if (rc) { fail(j, "cannot read %s", src, -rc); return rc; }
-  if (!st.is_dir) return copy_file(j, v, src, dst, st.mtime, buf);
+  if (!st.is_dir) return copy_file(j, v, dv, src, dst, st.mtime, buf);
 
-  if (mkdir(dst, 0777) && errno != EEXIST) {
-    rc = -errno;
+  ventry_t dst_st;
+  rc = vfs_stat(dv, dst, &dst_st);
+  if (rc == -ENOENT) rc = vfs_mkdir(dv, dst);
+  else if (!rc && !dst_st.is_dir) rc = -EEXIST;
+  if (rc && rc != -EEXIST) {
     fail(j, "cannot create folder %s", dst, -rc);
+    return rc;
+  }
+  if (rc == -EEXIST && vfs_stat(dv, dst, &dst_st) == 0 && !dst_st.is_dir) {
+    fail(j, "a file is in the way of folder %s", dst, 0);
     return rc;
   }
   vlist_t l;
@@ -222,8 +241,8 @@ static int copy_tree(job_t *j, vol_t *v, const char *src, const char *dst,
       rc = -ENAMETOOLONG;
       break;
     }
-    rc = l.e[i].is_dir ? copy_tree(j, v, cs, cd, buf, depth + 1)
-                       : copy_file(j, v, cs, cd, l.e[i].mtime, buf);
+    rc = l.e[i].is_dir ? copy_tree(j, v, dv, cs, cd, buf, depth + 1)
+                       : copy_file(j, v, dv, cs, cd, l.e[i].mtime, buf);
   }
   vfs_list_free(&l);
   return rc;
@@ -236,20 +255,42 @@ static void run_job(job_t *j) {
     set_state(j, J_FAILED);
     return;
   }
+  vol_t *dv = vfs_get(j->dvol);
+  if (!dv) {
+    vfs_put(v);
+    fail(j, "destination drive %s is no longer available", j->dvol, 0);
+    set_state(j, J_FAILED);
+    return;
+  }
   uint8_t *buf = malloc(COPY_BUF);
   int rc = buf ? 0 : -ENOMEM;
+  if (!rc && dv->kind == VOL_NTFS && !ntfs_is_writable(dv->ntfs)) {
+    fail(j, "writing is not enabled on %s", dv->label[0] ? dv->label : dv->id, 0);
+    rc = -EROFS;
+  }
 
   set_state(j, J_SCANNING);
-  if (!rc) rc = scan(j, v, j->src, 0);
+  char top[2048] = "";
+  if (!rc) {
+    const char *base = strrchr(j->src, '/');
+    base = base && base[1] ? base + 1 : "";
+    char nm[1024];
+    if (!*base) snprintf(nm, sizeof nm, "%s", v->label[0] ? v->label : v->id);
+    else snprintf(nm, sizeof nm, "%s", base);
+    safe_name(nm, sizeof nm, nm);
+    if (join(top, sizeof top, j->dest, nm)) rc = -ENAMETOOLONG;
+  }
+  if (!rc) rc = scan(j, v, dv, j->src, top, 0);
 
   if (!rc) {
-    struct statfs sf;
-    if (statfs(j->dest, &sf) == 0) {
-      uint64_t avail = (uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize;
-      if (avail < j->total_bytes) {
+    int64_t fr = vfs_free_bytes(dv, j->dest);
+    if (fr >= 0) {
+      uint64_t avail = (uint64_t)fr;
+      uint64_t needed = j->total_bytes - j->present_bytes;
+      if (avail < needed) {
         char need[64];
-        snprintf(need, sizeof need, "%.1f GB needed, %.1f GB free",
-                 j->total_bytes / 1e9, avail / 1e9);
+        snprintf(need, sizeof need, "%.2f GB needed, %.2f GB free",
+                 needed / 1e9, avail / 1e9);
         fail(j, "not enough space: %s", need, 0);
         rc = -ENOSPC;
       }
@@ -257,21 +298,12 @@ static void run_job(job_t *j) {
   }
 
   if (!rc) {
+    /* top is dest + the source's name (a volume root uses its label). */
     set_state(j, J_COPYING);
-    const char *base = strrchr(j->src, '/');
-    base = base && base[1] ? base + 1 : "";
-    char nm[1024], dst[2048];
-    if (!*base) {
-      /* Copying a volume root: use the volume label as the folder name. */
-      snprintf(nm, sizeof nm, "%s", v->label[0] ? v->label : v->id);
-      safe_name(nm, sizeof nm, nm);
-    } else {
-      safe_name(nm, sizeof nm, base);
-    }
-    if (join(dst, sizeof dst, j->dest, nm)) rc = -ENAMETOOLONG;
-    else rc = copy_tree(j, v, j->src, dst, buf, 0);
+    rc = copy_tree(j, v, dv, j->src, top, buf, 0);
   }
   free(buf);
+  vfs_put(dv);
   vfs_put(v);
 
   pthread_mutex_lock(&g_lock);
@@ -315,15 +347,27 @@ void jobs_init(void) {
   pthread_attr_destroy(&at);
 }
 
-int jobs_copy(const char *vol, const char *src, const char *dest_dir, char *err,
-              size_t errlen) {
-  struct stat st;
-  if (stat(dest_dir, &st) || !S_ISDIR(st.st_mode)) {
+int jobs_copy(const char *vol, const char *src, const char *dvol, const char *dest_dir,
+              char *err, size_t errlen) {
+  vol_t *dv = vfs_get(dvol);
+  if (!dv) {
+    snprintf(err, errlen, "destination drive not found");
+    return -ENOENT;
+  }
+  ventry_t st;
+  int src_ok = vfs_stat(dv, dest_dir, &st) == 0 && st.is_dir;
+  int ro = dv->kind == VOL_NTFS && !ntfs_is_writable(dv->ntfs);
+  vfs_put(dv);
+  if (ro) {
+    snprintf(err, errlen, "turn on writing for this drive first");
+    return -EROFS;
+  }
+  if (!src_ok) {
     snprintf(err, errlen, "destination folder does not exist: %s", dest_dir);
     return -ENOENT;
   }
-  if (!strcmp(vol, "ps5")) {
-    /* Native to native: refuse copying a folder into itself. */
+  if (!strcmp(vol, dvol)) {
+    /* Same drive: refuse copying a folder into itself. */
     size_t n = strlen(src);
     if (!strncmp(dest_dir, src, n) && (dest_dir[n] == '/' || !dest_dir[n])) {
       snprintf(err, errlen, "cannot copy a folder into itself");
@@ -333,6 +377,7 @@ int jobs_copy(const char *vol, const char *src, const char *dest_dir, char *err,
   job_t *j = calloc(1, sizeof *j);
   if (!j) { snprintf(err, errlen, "out of memory"); return -ENOMEM; }
   snprintf(j->vol, sizeof j->vol, "%s", vol);
+  snprintf(j->dvol, sizeof j->dvol, "%s", dvol);
   snprintf(j->src, sizeof j->src, "%s", src);
   snprintf(j->dest, sizeof j->dest, "%s", dest_dir);
   j->state = J_QUEUED;
@@ -407,6 +452,8 @@ void jobs_json(buf_t *b) {
     buf_json_str(b, j->vol);
     buf_puts(b, ",\"src\":");
     buf_json_str(b, j->src);
+    buf_puts(b, ",\"dvol\":");
+    buf_json_str(b, j->dvol);
     buf_puts(b, ",\"dest\":");
     buf_json_str(b, j->dest);
     buf_puts(b, ",\"current\":");

@@ -34,6 +34,8 @@ static int err_status(int rc) {
     case EACCES:  return 403;
     case EPERM:   return 403;
     case EINVAL:  return 400;
+    case EEXIST:  return 409;
+    case EROFS:   return 403;
     default:      return 500;
   }
 }
@@ -41,6 +43,8 @@ static int err_status(int rc) {
 static const char *err_text(int rc) {
   if (rc == -EACCES) return "access denied (encrypted or protected)";
   if (rc == -EIO) return "I/O error (drive removed or file system damaged?)";
+  if (rc == -EROFS) return "turn on writing for this drive first";
+  if (rc == -EEXIST) return "something with that name already exists";
   return strerror(-rc);
 }
 
@@ -309,55 +313,75 @@ static void route_unmount(http_req_t *r) {
   route_volumes(r);
 }
 
-static int mkdir_p(const char *path) {
-  char tmp[1024];
-  snprintf(tmp, sizeof tmp, "%s", path);
-  for (char *p = tmp + 1; *p; p++) {
-    if (*p != '/') continue;
-    *p = 0;
-    if (mkdir(tmp, 0777) && errno != EEXIST) return -errno;
-    *p = '/';
-  }
-  if (mkdir(tmp, 0777) && errno != EEXIST) return -errno;
-  return 0;
-}
-
 static void route_mkdir(http_req_t *r) {
   if (require_post(r)) return;
-  char raw[1024] = "", path[1024];
-  http_param(r, "path", raw, sizeof raw);
-  if (!raw[0] || vfs_clean_path(raw, path, sizeof path)) {
-    http_send_error(r, 400, "bad path");
-    return;
-  }
-  int rc = mkdir_p(path);
+  char path[1024];
+  vol_t *v = get_vol_path(r, path, sizeof path);
+  if (!v) return;
+  int rc;
+  ventry_t st;
+  if (!strcmp(path, "/") || vfs_stat(v, path, &st) == 0) rc = -EEXIST;
+  else if (v->kind == VOL_NTFS && !ntfs_is_writable(v->ntfs)) rc = -EROFS;
+  else rc = vfs_mkdirs(v, path);
+  vfs_put(v);
   if (rc) {
-    http_send_error(r, err_status(rc), strerror(-rc));
+    http_send_error(r, err_status(rc), err_text(rc));
     return;
   }
   http_send(r, 200, "application/json", "{}", 2, NULL);
 }
 
+static void route_writable(http_req_t *r) {
+  if (require_post(r)) return;
+  char vol[32] = "", on[8] = "1", err[256] = "";
+  http_param(r, "vol", vol, sizeof vol);
+  http_param(r, "on", on, sizeof on);
+  vol_t *v = vfs_get(vol);
+  if (!v) {
+    http_send_error(r, 404, "volume not found");
+    return;
+  }
+  int rc = vfs_set_writable(v, on[0] == '1', err, sizeof err);
+  vfs_put(v);
+  if (rc) {
+    http_send_error(r, 409, err[0] ? err : strerror(-rc));
+    return;
+  }
+  route_volumes(r);
+}
+
 static void route_copy(http_req_t *r) {
   if (require_post(r)) return;
-  char vol[32] = "", src_raw[1024] = "", dest_raw[1024] = "", src[1024], dest[1024];
-  char err[256];
+  char vol[32] = "", dvol[32] = "", src_raw[1024] = "", dest_raw[1024] = "";
+  char src[1024], dest[1024], err[256];
   http_param(r, "vol", vol, sizeof vol);
+  http_param(r, "dvol", dvol, sizeof dvol);
   http_param(r, "path", src_raw, sizeof src_raw);
   http_param(r, "dest", dest_raw, sizeof dest_raw);
-  if (!dest_raw[0]) snprintf(dest_raw, sizeof dest_raw, "%s", plat_default_dest());
+  if (!dvol[0]) snprintf(dvol, sizeof dvol, "ps5");
+  if (!dest_raw[0])
+    snprintf(dest_raw, sizeof dest_raw, "%s", strcmp(dvol, "ps5") ? "/" : plat_default_dest());
   if (vfs_clean_path(src_raw, src, sizeof src) ||
       vfs_clean_path(dest_raw, dest, sizeof dest)) {
     http_send_error(r, 400, "bad path");
     return;
   }
-  int rc = mkdir_p(dest);
-  if (rc) {
-    snprintf(err, sizeof err, "cannot create %s: %s", dest, strerror(-rc));
-    http_send_error(r, 400, err);
+  vol_t *dv = vfs_get(dvol);
+  if (!dv) {
+    http_send_error(r, 404, "destination drive not found");
     return;
   }
-  int id = jobs_copy(vol[0] ? vol : "ps5", src, dest, err, sizeof err);
+  int rc = 0;
+  if (dv->kind == VOL_NTFS && !ntfs_is_writable(dv->ntfs)) rc = -EROFS;
+  else rc = vfs_mkdirs(dv, dest);
+  vfs_put(dv);
+  if (rc) {
+    if (rc == -EROFS) snprintf(err, sizeof err, "turn on writing for this drive first");
+    else snprintf(err, sizeof err, "cannot create %s: %s", dest, strerror(-rc));
+    http_send_error(r, rc == -EROFS ? 403 : 400, err);
+    return;
+  }
+  int id = jobs_copy(vol[0] ? vol : "ps5", src, dvol, dest, err, sizeof err);
   if (id < 0) {
     http_send_error(r, 400, err);
     return;
@@ -412,6 +436,7 @@ void api_handle(http_req_t *r) {
       {"/api/mount", route_mount},
       {"/api/unmount", route_unmount},
       {"/api/mkdir", route_mkdir},
+      {"/api/writable", route_writable},
       {"/api/copy", route_copy},
       {"/api/jobs", route_jobs},
       {"/api/jobs/cancel", route_cancel},

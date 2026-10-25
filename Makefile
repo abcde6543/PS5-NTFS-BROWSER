@@ -4,6 +4,7 @@
 #   make deploy          send it to the console (PS5_HOST, PS5_PORT)
 #   make host            build the desktop version + ntfstool for testing
 #   make test            run the NTFS test suite (Linux, root, ntfs-3g)
+#   make dist            build the release zip
 #   make clean
 
 PS5_HOST ?= ps5
@@ -17,7 +18,7 @@ HOST_CC ?= cc
 HOST_WARN := $(shell $(HOST_CC) -Werror -Wno-format-truncation -x c -c -o /dev/null /dev/null 2>/dev/null && echo -Wno-format-truncation)
 
 SRCS := src/main.c src/api.c src/http.c src/vfs.c src/jobs.c src/platform.c \
-        src/ntfs.c src/bdev.c src/part.c src/utf.c
+        src/ntfs.c src/ntfs_write.c src/bdev.c src/part.c src/utf.c
 HDRS := $(wildcard src/*.h) build/web_index.h
 
 COMMON_CFLAGS := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -O2 -Ibuild \
@@ -29,7 +30,7 @@ PS5_DEPLOY := $(PS5_PAYLOAD_SDK)/bin/prospero-deploy
 
 ELF := ntfs-browser.elf
 
-.PHONY: all ps5 host test deploy clean
+.PHONY: all ps5 host test deploy clean dist
 
 all: ps5
 
@@ -52,19 +53,30 @@ host: build/ntfs-browser build/ntfstool
 build/ntfs-browser: $(SRCS) $(HDRS)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_WARN) -D_GNU_SOURCE -g -o $@ $(SRCS) -lpthread
 
-build/ntfstool: tools/ntfstool.c src/ntfs.c src/bdev.c src/part.c src/utf.c $(wildcard src/*.h)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_WARN) -D_GNU_SOURCE -g -o $@ tools/ntfstool.c src/ntfs.c src/bdev.c src/part.c src/utf.c -lpthread
+build/ntfstool: tools/ntfstool.c src/ntfs.c src/ntfs_write.c src/bdev.c src/part.c src/utf.c $(wildcard src/*.h)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_WARN) -D_GNU_SOURCE -g -o $@ tools/ntfstool.c src/ntfs.c src/ntfs_write.c src/bdev.c src/part.c src/utf.c -lpthread
 
 # Sanitiser build of the test tool, used by the test suite.
-build/ntfstool-asan: tools/ntfstool.c src/ntfs.c src/bdev.c src/part.c src/utf.c $(wildcard src/*.h)
+build/ntfstool-asan: tools/ntfstool.c src/ntfs.c src/ntfs_write.c src/bdev.c src/part.c src/utf.c $(wildcard src/*.h)
 	@mkdir -p build
 	$(HOST_CC) -std=gnu11 -D_GNU_SOURCE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
-	  -o $@ tools/ntfstool.c src/ntfs.c src/bdev.c src/part.c src/utf.c -lpthread
+	  -o $@ tools/ntfstool.c src/ntfs.c src/ntfs_write.c src/bdev.c src/part.c src/utf.c -lpthread
 
-test: build/ntfstool-asan build/ntfs-browser
+test: build/ntfstool-asan build/ntfs-browser build/ntfstool
 	python3 tests/run_tests.py build/ntfstool-asan
 	python3 tests/fuzz.py build/ntfstool-asan
+	python3 tests/write_tests.py build/ntfstool-asan
 	python3 tests/test_server.py build/ntfs-browser
+
+VERSION := $(shell sed -n 's/.*APP_VERSION "\(.*\)".*/\1/p' src/api.h)
+
+# Release package: payload + docs in a zip.
+dist: $(ELF)
+	rm -rf build/dist && mkdir -p build/dist/ntfs-browser-v$(VERSION)
+	cp $(ELF) README.md LICENSE build/dist/ntfs-browser-v$(VERSION)/
+	cd build/dist && rm -f ../../ntfs-browser-v$(VERSION).zip && \
+	  python3 -c "import shutil; shutil.make_archive('../../ntfs-browser-v$(VERSION)', 'zip', '.', 'ntfs-browser-v$(VERSION)')"
+	@echo "built ntfs-browser-v$(VERSION).zip"
 
 deploy: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $(ELF)

@@ -7,104 +7,26 @@
 #include <string.h>
 
 #include "endian_util.h"
+#include "ntfs_priv.h"
 #include "utf.h"
 
-/* ---- On-disk constants --------------------------------------------------- */
-
-#define AT_STANDARD_INFORMATION 0x10
-#define AT_ATTRIBUTE_LIST       0x20
-#define AT_FILE_NAME            0x30
-#define AT_VOLUME_NAME          0x60
-#define AT_VOLUME_INFORMATION   0x70
-#define AT_DATA                 0x80
-#define AT_INDEX_ROOT           0x90
-#define AT_INDEX_ALLOCATION     0xA0
-#define AT_END                  0xFFFFFFFFu
-
-#define ATTR_COMPRESSED 0x0001
-#define ATTR_ENCRYPTED  0x4000
-#define ATTR_SPARSE     0x8000
-
-#define MFT_IN_USE    0x0001
-#define MFT_DIRECTORY 0x0002
-
-#define IE_NODE 0x01  /* entry has a sub-node */
-#define IE_LAST 0x02  /* terminating entry, no key */
-
-#define NS_DOS 2
-
-#define INODE_MFT     0
-#define INODE_VOLUME  3
-#define INODE_BITMAP  6
-#define INODE_UPCASE  10
-#define FIRST_USER_INODE 16
-
-#define MREF(x) ((x) & 0x0000FFFFFFFFFFFFULL)
-
-#define MAX_DEPTH 32
-
-static const uint16_t I30[] = {'$', 'I', '3', '0'};
-
-/* ---- In-memory structures ------------------------------------------------ */
-
-typedef struct run {
-  int64_t  vcn;
-  int64_t  lcn;   /* -1 = sparse (reads as zeros) */
-  uint64_t len;   /* clusters */
-} run_t;
-
-typedef struct attr {
-  int      resident;
-  uint8_t *data;        /* resident value */
-  uint32_t data_len;
-  run_t   *runs;
-  size_t   nruns, cap;
-  uint64_t size, init, alloc;
-  uint16_t flags;
-  uint32_t cu_clusters; /* compression unit, 0 if not compressed */
-
-  /* Cache of the most recently decompressed compression unit. */
-  uint8_t *cu_buf;
-  int64_t  cu_idx;
-} attr_t;
-
-struct ntfs_vol {
-  pthread_mutex_t lock;
-  bdev_t  *dev;
-  uint32_t cluster;
-  uint32_t rec_size;
-  uint64_t total_clusters;
-  uint64_t serial;
-  attr_t   mft;          /* $MFT unnamed $DATA */
-  uint16_t *upcase;
-  uint32_t upcase_len;
-  char     label[128];
-  uint8_t  ver_major, ver_minor;
-  int      dirty;
-  int      free_known;
-  uint64_t free_clusters;
-};
-
-struct ntfs_file {
-  ntfs_vol_t *v;
-  attr_t      a;
-};
+const uint16_t I30[4] = {'$', 'I', '3', '0'};
 
 /* ---- Small helpers ------------------------------------------------------- */
 
-static int64_t nt2unix(uint64_t t) {
+int64_t nt2unix(uint64_t t) {
   /* 100ns intervals since 1601-01-01 -> seconds since 1970-01-01 */
   return (int64_t)(t / 10000000ULL) - 11644473600LL;
 }
 
-static void attr_free(attr_t *a) {
+void attr_free(attr_t *a) {
   free(a->data);
   free(a->runs);
   free(a->cu_buf);
   memset(a, 0, sizeof *a);
 }
 
-static int run_push(attr_t *a, int64_t vcn, int64_t lcn, uint64_t len) {
+int run_push(attr_t *a, int64_t vcn, int64_t lcn, uint64_t len) {
   /* Merge with the previous run when contiguous; keeps lists short. */
   if (a->nruns) {
     run_t *p = &a->runs[a->nruns - 1];
@@ -127,7 +49,7 @@ static int run_push(attr_t *a, int64_t vcn, int64_t lcn, uint64_t len) {
 }
 
 /* Decode a mapping-pairs array (the run list of a non-resident attribute). */
-static int decode_runs(attr_t *a, const uint8_t *p, const uint8_t *end,
+int decode_runs(attr_t *a, const uint8_t *p, const uint8_t *end,
                        int64_t vcn) {
   int64_t lcn = 0;
   while (p < end && *p) {
@@ -156,7 +78,7 @@ static int decode_runs(attr_t *a, const uint8_t *p, const uint8_t *end,
 }
 
 /* Apply the update sequence array ("fixups") of a multi-sector record. */
-static int apply_fixups(uint8_t *buf, uint32_t size) {
+int apply_fixups(uint8_t *buf, uint32_t size) {
   uint16_t ofs = le16(buf + 4), cnt = le16(buf + 6);
   if (cnt < 2 || (uint32_t)(cnt - 1) * 512 != size || ofs + cnt * 2u > size ||
       (ofs & 1))
@@ -226,7 +148,7 @@ ssize_t ntfs_lznt1_decompress(const uint8_t *src, size_t srclen, uint8_t *dst,
 
 /* ---- Attribute data access ----------------------------------------------- */
 
-static const run_t *find_run(const attr_t *a, int64_t vcn) {
+const run_t *find_run(const attr_t *a, int64_t vcn) {
   size_t lo = 0, hi = a->nruns;
   while (lo < hi) {
     size_t mid = (lo + hi) / 2;
@@ -302,7 +224,7 @@ static int load_cu(ntfs_vol_t *v, attr_t *a, int64_t idx) {
 }
 
 /* Read from an attribute's value. Returns bytes read (short at EOF). */
-static ssize_t attr_pread(ntfs_vol_t *v, attr_t *a, uint64_t off, void *out,
+ssize_t attr_pread(ntfs_vol_t *v, attr_t *a, uint64_t off, void *out,
                           size_t len) {
   uint8_t *buf = out;
   if (off >= a->size) return 0;
@@ -344,7 +266,16 @@ static ssize_t attr_pread(ntfs_vol_t *v, attr_t *a, uint64_t off, void *out,
 
 /* ---- MFT records --------------------------------------------------------- */
 
-static int read_record(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
+int read_record_any(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
+  uint64_t off = inode * v->rec_size;
+  if (off >= v->mft.size) return -ENOENT;
+  ssize_t n = attr_pread(v, &v->mft, off, buf, v->rec_size);
+  if (n != (ssize_t)v->rec_size) return -EIO;
+  if (memcmp(buf, "FILE", 4) != 0) return -ENOENT;
+  return apply_fixups(buf, v->rec_size) ? -EIO : 0;
+}
+
+int read_record(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
   uint64_t off = inode * v->rec_size;
   if (off >= v->mft.size) return -ENOENT;
   ssize_t n = attr_pread(v, &v->mft, off, buf, v->rec_size);
@@ -356,7 +287,7 @@ static int read_record(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
 }
 
 /* Iterate attributes in a record. *pos starts at 0. */
-static const uint8_t *next_attr(const uint8_t *rec, uint32_t rec_size,
+const uint8_t *next_attr(const uint8_t *rec, uint32_t rec_size,
                                 uint32_t *pos) {
   uint32_t p = *pos ? *pos : le16(rec + 0x14);
   uint32_t used = le32(rec + 0x18);
@@ -369,7 +300,7 @@ static const uint8_t *next_attr(const uint8_t *rec, uint32_t rec_size,
   return at;
 }
 
-static int attr_name_eq(const uint8_t *at, const uint16_t *name, int nlen) {
+int attr_name_eq(const uint8_t *at, const uint16_t *name, int nlen) {
   if (at[9] != nlen) return 0;
   const uint8_t *n = at + le16(at + 10);
   for (int i = 0; i < nlen; i++)
@@ -378,7 +309,7 @@ static int attr_name_eq(const uint8_t *at, const uint16_t *name, int nlen) {
 }
 
 /* Merge one attribute record (a segment for non-resident ones) into a. */
-static int absorb(attr_t *a, const uint8_t *at, uint32_t at_len, int first) {
+int absorb(attr_t *a, const uint8_t *at, uint32_t at_len, int first) {
   if (!at[8]) {
     uint32_t vlen = le32(at + 16);
     uint16_t voff = le16(at + 20);
@@ -410,7 +341,7 @@ static int absorb(attr_t *a, const uint8_t *at, uint32_t at_len, int first) {
 
 /* Find an attribute of an inode, following $ATTRIBUTE_LIST if present.
  * name may be NULL (unnamed). */
-static int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
+int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
                      const uint16_t *name, int nlen, attr_t *out) {
   memset(out, 0, sizeof *out);
   out->cu_idx = -1;
@@ -504,7 +435,6 @@ typedef struct idx_ctx {
 } idx_ctx_t;
 
 /* Callback: return 1 to stop the walk, 0 to continue, <0 on error. */
-typedef int (*idx_cb)(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen);
 
 static int walk_node(idx_ctx_t *ix, const uint8_t *p, const uint8_t *end,
                      int depth, idx_cb cb, void *ctx);
@@ -538,7 +468,7 @@ static int walk_node(idx_ctx_t *ix, const uint8_t *p, const uint8_t *end,
     }
     if (flags & IE_LAST) return 0;
     if (klen >= 0x42 && 16u + klen <= len) {
-      int rc = cb(ctx, MREF(le64(p)), p + 16, klen);
+      int rc = cb(ctx, le64(p), p + 16, klen);
       if (rc) return rc;
     }
     p += len;
@@ -546,7 +476,7 @@ static int walk_node(idx_ctx_t *ix, const uint8_t *p, const uint8_t *end,
   return 0;
 }
 
-static int index_walk(ntfs_vol_t *v, uint64_t inode, idx_cb cb, void *ctx) {
+int index_walk(ntfs_vol_t *v, uint64_t inode, idx_cb cb, void *ctx) {
   attr_t root;
   int rc = attr_find(v, inode, AT_INDEX_ROOT, I30, 4, &root);
   if (rc) return rc == -ENOENT ? -ENOTDIR : rc;
@@ -578,7 +508,7 @@ static int index_walk(ntfs_vol_t *v, uint64_t inode, idx_cb cb, void *ctx) {
 
 /* ---- Stat ---------------------------------------------------------------- */
 
-static int stat_locked(ntfs_vol_t *v, uint64_t inode, ntfs_stat_t *st) {
+int stat_locked(ntfs_vol_t *v, uint64_t inode, ntfs_stat_t *st) {
   uint8_t *rec = malloc(v->rec_size);
   if (!rec) return -ENOMEM;
   int rc = read_record(v, inode, rec);
@@ -641,6 +571,7 @@ typedef struct dlist {
 
 static int collect_cb(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen) {
   dlist_t *l = ctx;
+  ref = MREF(ref);
   uint8_t nchars = fn[0x40], ns = fn[0x41];
   if (ns == NS_DOS) return 0;
   if (0x42u + nchars * 2u > fnlen) return 0;
@@ -702,7 +633,7 @@ typedef struct find_ctx {
   uint64_t        ref;
 } find_ctx_t;
 
-static uint16_t up(const ntfs_vol_t *v, uint16_t c) {
+uint16_t up(const ntfs_vol_t *v, uint16_t c) {
   if (c < v->upcase_len) return v->upcase[c];
   if (!v->upcase_len && c >= 'a' && c <= 'z') return (uint16_t)(c - 32);
   return c;
@@ -710,6 +641,7 @@ static uint16_t up(const ntfs_vol_t *v, uint16_t c) {
 
 static int find_cb(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen) {
   find_ctx_t *f = ctx;
+  ref = MREF(ref);
   uint8_t n = fn[0x40];
   if (n != f->len || 0x42u + n * 2u > fnlen) return 0;
   /* Exact match wins straight away. */
@@ -724,7 +656,7 @@ static int find_cb(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen) {
   return exact ? 1 : 0; /* keep looking for an exact-case match */
 }
 
-static int lookup_locked(ntfs_vol_t *v, const char *path, uint64_t *inode) {
+int lookup_locked(ntfs_vol_t *v, const char *path, uint64_t *inode) {
   uint64_t cur = NTFS_ROOT_INODE;
   const char *p = path;
   while (*p) {
@@ -840,6 +772,12 @@ int ntfs_mount(bdev_t *b, ntfs_vol_t **out, char *err, size_t errlen) {
   v->serial = le64(bs + 0x48);
   uint64_t mft_lcn = le64(bs + 0x30);
   if (mft_lcn >= v->total_clusters) FAIL("MFT location out of range");
+  v->mft_lcn = mft_lcn;
+  v->mftmirr_lcn = le64(bs + 0x38);
+  v->sector = bps;
+  int8_t cpi = (int8_t)bs[0x44];
+  v->idx_size = cpi > 0 ? (uint32_t)cpi * v->cluster : 1u << -cpi;
+  if (v->idx_size < 512 || v->idx_size > 65536) v->idx_size = 4096;
 
   /* Bootstrap: read $MFT's own record straight from disk. */
   rec = malloc(v->rec_size);
@@ -854,7 +792,7 @@ int ntfs_mount(bdev_t *b, ntfs_vol_t **out, char *err, size_t errlen) {
   int have = 0, has_list = 0;
   while ((at = next_attr(rec, v->rec_size, &pos))) {
     uint32_t t = le32(at);
-    if (t == AT_ATTRIBUTE_LIST) has_list = 1;
+    if (t == AT_ATTRIBUTE_LIST) has_list = v->has_list_mft = 1;
     if (t == AT_DATA && at[9] == 0 && at[8] && !have) {
       if (absorb(&v->mft, at, le32(at + 4), 1)) FAIL("bad $MFT run list");
       have = 1;
@@ -932,6 +870,8 @@ fail:
 
 void ntfs_umount(ntfs_vol_t *v) {
   if (!v) return;
+  if (v->rw) bdev_flush(v->dev);
+  attr_free(&v->cbmp);
   bdev_close(v->dev);
   attr_free(&v->mft);
   free(v->upcase);

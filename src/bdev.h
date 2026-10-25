@@ -23,6 +23,17 @@ void bdev_close(bdev_t *b);
 /* Read len bytes at off. Returns 0 on success, -1 on error or past the end. */
 int bdev_read(bdev_t *b, uint64_t off, void *buf, size_t len);
 
+/* Reopen the underlying device read-write. Returns 0 or -errno. */
+int bdev_enable_write(bdev_t *b);
+int bdev_is_writable(const bdev_t *b);
+
+/* Write len bytes at off (any alignment; partial sectors are
+ * read-modify-written). Returns 0 on success, -1 on error. */
+int bdev_write(bdev_t *b, uint64_t off, const void *buf, size_t len);
+
+/* Push written data to the device. */
+int bdev_flush(bdev_t *b);
+
 uint64_t    bdev_size(const bdev_t *b);
 uint32_t    bdev_sector_size(const bdev_t *b);
 const char *bdev_path(const bdev_t *b);

@@ -75,6 +75,17 @@ svg.i { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor;
 .tag { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--panel-2);
   border: 1px solid var(--line); color: var(--muted); }
 .tag.warn { color: var(--warn); border-color: rgba(242,184,75,.4); }
+.tag.ok { color: var(--ok); border-color: rgba(52,199,123,.45); }
+.vol-row { display: flex; align-items: stretch; gap: 4px; }
+.vol-row .vol { flex: 1; min-width: 0; }
+.lockbtn { padding: 0 9px; border-radius: 9px; background: transparent; border: 1px solid transparent; color: var(--muted); }
+.lockbtn:hover { background: var(--panel-2); border-color: var(--line); color: var(--text); }
+.lockbtn.open { color: var(--ok); }
+select.full { width: 100%; }
+.warnbox { border: 1px solid rgba(242,184,75,.45); background: rgba(242,184,75,.08); border-radius: 10px; padding: 12px 14px;
+  color: var(--text); font-size: 13px; line-height: 1.55; margin: 0 0 14px; }
+.warnbox ul { margin: 6px 0 0; padding-left: 18px; }
+.inline-act { margin-top: 8px; }
 
 /* Main */
 #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -232,8 +243,9 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
       <span id="selInfo"></span>
       <span class="grow"></span>
       <label class="chk"><input type="checkbox" id="showHidden"> Show hidden &amp; system</label>
+      <button id="mkdirBtn" class="ghost" style="display:none"><svg class="i" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 10v6M9 13h6"/></svg>New folder</button>
       <button id="dlSelBtn" disabled><svg class="i" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Download</button>
-      <button id="copySelBtn" class="primary" disabled><svg class="i" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>Copy to PS5</button>
+      <button id="copySelBtn" class="primary" disabled><svg class="i" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>Copy to…</button>
     </div>
     <div id="listWrap">
       <div id="list" tabindex="0">
@@ -261,17 +273,19 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
 <div class="overlay" id="pvO"><div class="dialog wide" id="pv">
   <header><h2 id="pvTitle"></h2>
     <button id="pvDl"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Download</button>
-    <button id="pvCopy" class="primary">Copy to PS5</button>
+    <button id="pvCopy" class="primary">Copy to…</button>
     <button class="ghost" data-close title="Close"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
   </header>
   <div class="body" id="pvBody"></div>
 </div></div>
 
 <div class="overlay" id="cpO"><div class="dialog">
-  <header><h2>Copy to PS5</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
+  <header><h2>Copy to…</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
   <div class="body">
     <p class="note" id="cpWhat"></p>
-    <label class="field"><span>Destination folder on the console</span><input type="text" id="cpDest" autocomplete="off"></label>
+    <label class="field"><span>Destination drive</span><select id="cpVol" class="full"></select></label>
+    <div id="cpRo" class="warnbox" style="display:none"></div>
+    <label class="field"><span>Destination folder</span><input type="text" id="cpDest" autocomplete="off"></label>
     <div class="chips" id="cpPlaces"></div>
     <p class="note" style="margin-top:14px">Folders are copied with everything inside them. Files that already exist with the same size are skipped, so an interrupted copy can be resumed by starting it again.</p>
     <p class="note err" id="cpErr"></p>
@@ -292,6 +306,21 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
     <p class="note err" id="mtErr"></p>
   </div>
   <footer><button data-close>Cancel</button><button class="primary" id="mtGo">Open</button></footer>
+</div></div>
+
+<div class="overlay" id="wrO"><div class="dialog">
+  <header><h2 id="wrTitle">Allow writing to this drive?</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
+  <div class="body" id="wrBody"></div>
+  <footer><button data-close>Cancel</button><button class="primary" id="wrGo">Allow writing</button></footer>
+</div></div>
+
+<div class="overlay" id="mkO"><div class="dialog">
+  <header><h2>New folder</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
+  <div class="body">
+    <label class="field"><span id="mkWhere">Folder name</span><input type="text" id="mkName" autocomplete="off" placeholder="New folder"></label>
+    <p class="note err" id="mkErr"></p>
+  </div>
+  <footer><button data-close>Cancel</button><button class="primary" id="mkGo">Create</button></footer>
 </div></div>
 
 <div id="toast"></div>
@@ -318,6 +347,8 @@ var ICON = {
   dl: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   eject: '<path d="M12 5l7 8H5zM5 19h14"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  unlock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/>',
   link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'
 };
 function svg(name) { return '<svg class="i" viewBox="0 0 24 24">' + ICON[name] + '</svg>'; }
@@ -438,6 +469,7 @@ function refreshVolumes() {
   return api("/api/volumes").then(function (j) {
     S.vols = j.volumes; S.gen = j.gen;
     renderVols();
+    updateToolbar();
     S.vols.forEach(function (v) {
       if (v.kind !== "ntfs" || S.volInfo[v.id]) return;
       S.volInfo[v.id] = { pending: true };
@@ -457,18 +489,22 @@ function defaultNativePath() {
 
 function renderVols() {
   var h = [], ntfs = S.vols.filter(function (v) { return v.kind === "ntfs"; });
-  h.push('<div class="sect">NTFS drives <span class="tag">read-only</span></div>');
+  h.push('<div class="sect">NTFS drives</div>');
   if (!ntfs.length) {
     h.push('<div class="empty-vols">No NTFS drive found. Plug one into a USB port; it shows up here within a few seconds.</div>');
   }
   ntfs.forEach(function (v) {
     var info = S.volInfo[v.id] || {}, used = info.free != null ? (1 - info.free / v.size) * 100 : 0;
     var sub = fmtSize(v.size) + (info.free != null ? " · " + fmtSize(info.free) + " free" : "");
-    h.push('<button class="vol' + (S.vol === v.id ? " on" : "") + '" data-vol="' + esc(v.id) + '" data-path="/">' +
+    h.push('<div class="vol-row"><button class="vol' + (S.vol === v.id ? " on" : "") + '" data-vol="' + esc(v.id) + '" data-path="/">' +
       '<span class="ic k-pkg">' + svg("usb") + '</span><span class="meta"><span class="name">' + esc(volName(v)) +
       (v.dirty ? ' <span class="tag warn" title="Not cleanly unmounted on Windows">dirty</span>' : "") +
+      (v.writable ? ' <span class="tag ok">writable</span>' : ' <span class="tag">read-only</span>') +
       '</span><span class="sub">' + esc(sub) + '</span>' +
-      '<span class="bar"><i style="width:' + used.toFixed(1) + '%"></i></span></span></button>');
+      '<span class="bar"><i style="width:' + used.toFixed(1) + '%"></i></span></span></button>' +
+      '<button class="lockbtn' + (v.writable ? " open" : "") + '" data-lock="' + esc(v.id) + '" title="' +
+      (v.writable ? "Writing allowed: click to make read-only" : "Read-only: click to allow writing") + '">' +
+      svg(v.writable ? "unlock" : "lock") + '</button></div>');
   });
   var places = (S.status && S.status.places) || [{ path: "/", label: "Root /" }];
   h.push('<div class="sect">' + esc((volById("ps5") || {}).label || "Console") + '</div>');
@@ -482,6 +518,8 @@ function renderVols() {
 }
 
 $("vols").addEventListener("click", function (ev) {
+  var lk = ev.target.closest("[data-lock]");
+  if (lk) { openWrite(lk.getAttribute("data-lock")); return; }
   var b = ev.target.closest(".vol");
   if (!b) return;
   document.body.classList.remove("menu");
@@ -497,6 +535,7 @@ function load() {
   S.vol = vol; S.path = path;
   renderVols();
   renderCrumbs();
+  updateToolbar();
   var id = ++S.req;
   S.loading = true;
   showMsg('<div><div class="spin"></div><p>Reading folder…</p></div>');
@@ -599,7 +638,7 @@ function paint() {
       '<span class="sz">' + (e.d ? "" : fmtSize(e.s)) + '</span>' +
       '<span class="dt">' + fmtDate(e.t) + '</span>' +
       '<span class="acts">' + (e.d ? "" : '<button class="ghost" data-act="dl" title="Download">' + svg("dl") + '</button>') +
-      '<button class="ghost" data-act="copy" title="Copy to PS5">' + svg("copy") + '</button></span></div>');
+      '<button class="ghost" data-act="copy" title="Copy to…">' + svg("copy") + '</button></span></div>');
   }
   spacer.innerHTML = h.join("");
 }
@@ -723,7 +762,7 @@ function download(items) {
     }, n * 400);
   });
   if (S.status && S.status.platform === "ps5" && /PlayStation/i.test(navigator.userAgent)) {
-    toast("The PS5 browser can't save downloads. Use “Copy to PS5”, or open this page on a PC/phone.");
+    toast("The PS5 browser can't save downloads. Use “Copy to…” to copy it onto the console, or open this page on a PC/phone.");
   }
 }
 
@@ -834,6 +873,47 @@ document.querySelectorAll(".overlay").forEach(function (o) {
 
 /* ---------- copy ---------- */
 var cpItems = [];
+function canWrite(id) {
+  if (id === "ps5") return true;
+  var v = volById(id);
+  return !!(v && v.writable);
+}
+function defaultDest(id) {
+  var key = "ntfsb.dest." + (id === "ps5" ? "ps5" : "ntfs"), d = null;
+  try { d = localStorage.getItem(key); } catch (e) {}
+  if (d) return d;
+  return id === "ps5" ? ((S.status && S.status.default_dest) || "/data/NTFS-Copies") : "/PS5";
+}
+function fillCopyTargets(sel) {
+  var opts = [{ id: "ps5", label: (volById("ps5") || {}).label || "PS5 storage" }];
+  S.vols.forEach(function (v) { if (v.kind === "ntfs") opts.push({ id: v.id, label: volName(v) + (v.writable ? "" : " (read-only)") }); });
+  $("cpVol").innerHTML = opts.map(function (o) {
+    return '<option value="' + esc(o.id) + '"' + (o.id === sel ? " selected" : "") + '>' + esc(o.label) + '</option>';
+  }).join("");
+}
+function updateCopyTarget(keepPath) {
+  var id = $("cpVol").value, v = volById(id), ro = $("cpRo");
+  if (!keepPath) $("cpDest").value = defaultDest(id);
+  var chips = [];
+  if (id === "ps5") {
+    chips.push((S.status && S.status.default_dest) || "/data/NTFS-Copies");
+    ((S.status && S.status.places) || []).forEach(function (p) { if (p.path !== "/" && chips.indexOf(p.path) < 0) chips.push(p.path); });
+  } else {
+    chips.push("/PS5", "/");
+  }
+  if (S.vol === id && chips.indexOf(S.path) < 0) chips.push(S.path);
+  $("cpPlaces").innerHTML = chips.map(function (c) { return '<button data-d="' + esc(c) + '">' + esc(c) + '</button>'; }).join("");
+  if (v && v.kind === "ntfs" && !v.writable) {
+    ro.style.display = "";
+    ro.innerHTML = v.write_block ?
+      "<b>This drive can't be written to:</b> " + esc(v.write_block) + "." :
+      'This NTFS drive is read-only. Allow writing to copy files onto it.<div class="inline-act"><button class="primary" id="cpAllow">Allow writing…</button></div>';
+    $("cpGo").disabled = true;
+  } else {
+    ro.style.display = "none";
+    $("cpGo").disabled = false;
+  }
+}
 function openCopy(items) {
   if (!items.length) return;
   cpItems = items.slice();
@@ -841,16 +921,22 @@ function openCopy(items) {
   var bytes = files.reduce(function (a, e) { return a + e.s; }, 0);
   $("cpWhat").innerHTML = items.length === 1 ? "Copy <b>" + esc(items[0].n) + "</b>" + (items[0].d ? " (folder)" : " (" + fmtSize(items[0].s) + ")") :
     "Copy <b>" + items.length + " items</b>" + (files.length ? " · " + files.length + " file(s), " + fmtSize(bytes) : "") + (dirs ? " · " + dirs + " folder(s)" : "");
-  var dest;
-  try { dest = localStorage.getItem("ntfsb.dest"); } catch (e) {}
-  $("cpDest").value = dest || (S.status && S.status.default_dest) || "/data/NTFS-Copies";
-  var chips = [(S.status && S.status.default_dest) || "/data/NTFS-Copies"];
-  ((S.status && S.status.places) || []).forEach(function (p) { if (p.path !== "/" && chips.indexOf(p.path) < 0) chips.push(p.path); });
-  if (S.vol === "ps5" && chips.indexOf(S.path) < 0) chips.push(S.path);
-  $("cpPlaces").innerHTML = chips.map(function (c) { return '<button data-d="' + esc(c) + '">' + esc(c) + '</button>'; }).join("");
+  /* From an NTFS drive the natural target is the console, and the other way round. */
+  var target = "ps5";
+  if (S.vol === "ps5") {
+    var ntfs = S.vols.filter(function (v) { return v.kind === "ntfs"; });
+    var w = ntfs.filter(function (v) { return v.writable; })[0];
+    target = (w || ntfs[0] || { id: "ps5" }).id;
+  }
+  fillCopyTargets(target);
+  updateCopyTarget(false);
   $("cpErr").textContent = "";
   show("cpO");
 }
+$("cpVol").addEventListener("change", function () { updateCopyTarget(false); });
+$("cpRo").addEventListener("click", function (ev) {
+  if (ev.target.closest("#cpAllow")) openWrite($("cpVol").value, function () { fillCopyTargets($("cpVol").value); updateCopyTarget(true); });
+});
 $("cpPlaces").addEventListener("click", function (ev) {
   var b = ev.target.closest("button");
   if (b) $("cpDest").value = b.getAttribute("data-d");
@@ -858,9 +944,10 @@ $("cpPlaces").addEventListener("click", function (ev) {
 $("cpGo").addEventListener("click", startCopy);
 $("cpDest").addEventListener("keydown", function (ev) { if (ev.key === "Enter") startCopy(); });
 function startCopy() {
-  var dest = $("cpDest").value.trim();
-  if (!dest || dest[0] !== "/") { $("cpErr").textContent = "Enter an absolute folder path, for example /data/NTFS-Copies"; return; }
-  try { localStorage.setItem("ntfsb.dest", dest); } catch (e) {}
+  var dest = $("cpDest").value.trim(), dvol = $("cpVol").value;
+  if (!dest || dest[0] !== "/") { $("cpErr").textContent = "Enter a folder path starting with /, for example " + defaultDest(dvol); return; }
+  if (!canWrite(dvol)) { $("cpErr").textContent = "Allow writing to this drive first."; return; }
+  try { localStorage.setItem("ntfsb.dest." + (dvol === "ps5" ? "ps5" : "ntfs"), dest); } catch (e) {}
   $("cpGo").disabled = true;
   var vol = S.vol, base = S.path, items = cpItems.slice(), n = 0;
   (function next() {
@@ -873,12 +960,78 @@ function startCopy() {
       return;
     }
     var e = items[n++];
-    api("/api/copy", { vol: vol, path: joinPath(base, e.n), dest: dest }, "POST").then(next).catch(function (err) {
+    api("/api/copy", { vol: vol, path: joinPath(base, e.n), dvol: dvol, dest: dest }, "POST").then(next).catch(function (err) {
       $("cpGo").disabled = false;
       $("cpErr").textContent = err.message;
     });
   })();
 }
+
+/* ---------- write access ---------- */
+var wrState = null;
+function openWrite(id, after) {
+  var v = volById(id);
+  if (!v) return;
+  wrState = { id: id, after: after };
+  var body = $("wrBody"), go = $("wrGo");
+  go.disabled = false;
+  if (v.writable) {
+    $("wrTitle").textContent = "Make “" + volName(v) + "” read-only?";
+    body.innerHTML = '<p class="note">Copies onto this drive will stop being possible until you allow writing again. Everything already written stays on the drive.</p>';
+    go.textContent = "Make read-only";
+  } else if (v.write_block) {
+    $("wrTitle").textContent = "Writing isn't possible";
+    body.innerHTML = '<div class="warnbox"><b>' + esc(volName(v)) + ':</b> ' + esc(v.write_block) + '.</div>' +
+      '<p class="note">This protects the drive: writing to an NTFS volume that Windows still considers in use can corrupt it. Browsing and copying <i>from</i> the drive still work.</p>';
+    go.textContent = "OK";
+  } else {
+    $("wrTitle").textContent = "Allow writing to “" + volName(v) + "”?";
+    body.innerHTML = '<div class="warnbox">Writing uses this app\'s own NTFS driver. It only ever <b>adds</b> files and folders: nothing on the drive is changed, renamed or deleted.' +
+      '<ul><li>Don\'t unplug the drive while a copy is running.</li>' +
+      '<li>Back up anything irreplaceable first: writing NTFS from a non-Windows system always carries some risk.</li>' +
+      '<li>On Windows, if it ever offers to scan the drive, let it.</li></ul></div>' +
+      '<p class="note">You can make the drive read-only again at any time with the lock button.</p>';
+    go.textContent = "Allow writing";
+  }
+  show("wrO");
+}
+$("wrGo").addEventListener("click", function () {
+  var st = wrState, v = st && volById(st.id);
+  if (!v) { hide("wrO"); return; }
+  if (!v.writable && v.write_block) { hide("wrO"); return; }
+  var on = !v.writable, b = this;
+  b.disabled = true;
+  api("/api/writable", { vol: v.id, on: on ? "1" : "0" }, "POST").then(function (j) {
+    S.vols = j.volumes; S.gen = j.gen;
+    renderVols(); updateToolbar();
+    hide("wrO");
+    toast(on ? "Writing allowed on " + volName(v) : volName(v) + " is read-only again");
+    if (st.after) st.after();
+  }).catch(function (e) {
+    $("wrBody").insertAdjacentHTML("beforeend", '<p class="note err">' + esc(e.message) + '</p>');
+  }).then(function () { b.disabled = false; });
+});
+
+/* ---------- new folder ---------- */
+function updateToolbar() {
+  $("mkdirBtn").style.display = canWrite(S.vol) ? "" : "none";
+}
+$("mkdirBtn").addEventListener("click", function () {
+  $("mkName").value = ""; $("mkErr").textContent = "";
+  $("mkWhere").textContent = "New folder in " + (S.path === "/" ? volName(volById(S.vol)) : baseName(S.path));
+  show("mkO");
+});
+function doMkdir() {
+  var n = $("mkName").value.trim();
+  if (!n) return;
+  if (/[\/\\:*?"<>|]/.test(n)) { $("mkErr").textContent = 'Names can\'t contain \\ / : * ? " < > |'; return; }
+  $("mkGo").disabled = true;
+  api("/api/mkdir", { vol: S.vol, path: joinPath(S.path, n) }, "POST").then(function () {
+    hide("mkO"); toast("Created " + n); load();
+  }).catch(function (e) { $("mkErr").textContent = e.message; }).then(function () { $("mkGo").disabled = false; });
+}
+$("mkGo").addEventListener("click", doMkdir);
+$("mkName").addEventListener("keydown", function (ev) { if (ev.key === "Enter") doMkdir(); });
 
 /* ---------- transfers ---------- */
 var jobsTimer = null, jobsData = [];
@@ -899,6 +1052,11 @@ function renderJobs() {
     var speed = j.elapsed_ms > 500 ? j.done_bytes / (j.elapsed_ms / 1000) : 0;
     var eta = speed && j.state === "copying" ? (j.total_bytes - j.done_bytes) / speed : NaN;
     if (j.state === "queued" || j.state === "copying" || j.state === "scanning") active++;
+    if (lastJobState[j.id] && lastJobState[j.id] !== j.state && (j.state === "done" || j.state === "failed" || j.state === "cancelled")) {
+      /* Free space changed on the destination drive. */
+      if (j.dvol && j.dvol !== "ps5") { delete S.volInfo[j.dvol]; refreshVolumes(); }
+      if (j.dvol === S.vol) load();
+    }
     if (lastJobState[j.id] && lastJobState[j.id] !== j.state && j.state === "done") toast("Copied " + baseName(j.src) + " to " + j.dest);
     if (lastJobState[j.id] && lastJobState[j.id] !== j.state && j.state === "failed") toast("Copy failed: " + j.error, true);
     lastJobState[j.id] = j.state;
@@ -910,11 +1068,11 @@ function renderJobs() {
     return '<div class="job ' + j.state + '"><div class="t"><b title="' + esc(j.src) + '">' + esc(baseName(j.src) || volName(vol) || j.src) + '</b>' +
       '<span class="st-' + j.state + '">' + j.state + '</span>' +
       (j.state === "queued" || j.state === "copying" || j.state === "scanning" ? '<button class="ghost" data-cancel="' + j.id + '">Cancel</button>' : "") +
-      '</div><div class="s">→ ' + esc(j.dest) + '</div><div class="s">' + esc(detail) + '</div>' +
+      '</div><div class="s">→ ' + esc((j.dvol && j.dvol !== "ps5" ? volName(volById(j.dvol)) || j.dvol : "PS5") + ": " + j.dest) + '</div><div class="s">' + esc(detail) + '</div>' +
       (j.state === "copying" ? '<div class="s">' + esc(j.current) + '</div>' : "") +
       '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div></div>';
   });
-  $("jbList").innerHTML = h.length ? h.join("") : '<p class="note">No transfers yet. Select files or folders and choose “Copy to PS5”.</p>';
+  $("jbList").innerHTML = h.length ? h.join("") : '<p class="note">No transfers yet. Select files or folders and choose “Copy to…”.</p>';
   var b = $("jobBadge");
   b.style.display = active ? "" : "none";
   b.textContent = active;

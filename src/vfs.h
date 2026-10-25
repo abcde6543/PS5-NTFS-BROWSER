@@ -81,6 +81,38 @@ int     vfs_open(vol_t *v, const char *path, vfile_t *f);
 ssize_t vfs_pread(vfile_t *f, void *buf, size_t len, uint64_t off);
 void    vfs_close(vfile_t *f);
 
+/* ---- Writing ---- */
+
+/* Turn writing on/off for an NTFS volume. err gets the reason on failure. */
+int vfs_set_writable(vol_t *v, int on, char *err, size_t errlen);
+
+/* Create one folder (parent must exist). */
+int vfs_mkdir(vol_t *v, const char *path);
+
+/* Make sure a folder and its parents exist. */
+int vfs_mkdirs(vol_t *v, const char *path);
+
+/* Free bytes on the volume that holds path (-1 if unknown). */
+int64_t vfs_free_bytes(vol_t *v, const char *path);
+
+typedef struct vwfile {
+  vol_t        *vol;
+  int           fd;
+  ntfs_wfile_t *nw;
+  int64_t       mtime;
+  char          tmp[1100], final[1100];
+} vwfile_t;
+
+/* Open path for writing a file of exactly size bytes. If the same file was
+ * partly written before, *done says how much is there already (writing
+ * continues from it); *done == size means it is already complete.
+ * -EEXIST if a different file has that name. */
+int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
+              vwfile_t *w, uint64_t *done);
+int vfs_wwrite(vwfile_t *w, const void *buf, size_t len);
+/* ok = 0 abandons the file (native: removes the partial copy). */
+int vfs_wclose(vwfile_t *w, int ok);
+
 /* Normalise a client-supplied path: collapse "//", drop "." and reject "..".
  * Output always starts with '/'. Returns 0 on success. */
 int vfs_clean_path(const char *in, char *out, size_t outlen);

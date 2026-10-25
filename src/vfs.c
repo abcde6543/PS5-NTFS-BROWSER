@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/time.h>
+#if defined(__linux__)
+#include <sys/statfs.h>
+#endif
+#include <time.h>
 #include <unistd.h>
 
 #include "bdev.h"
@@ -340,6 +346,11 @@ void vfs_volumes_json(buf_t *b) {
     buf_json_str(b, v->label);
     buf_puts(b, ",\"device\":");
     buf_json_str(b, v->device);
+    char why[256] = "";
+    int rw = ntfs_is_writable(v->ntfs);
+    if (!rw) ntfs_can_write(v->ntfs, why, sizeof why);
+    buf_printf(b, ",\"writable\":%s,\"write_block\":", rw ? "true" : "false");
+    buf_json_str(b, why);
     buf_printf(b, ",\"scheme\":\"%s\",\"partition\":%d,\"size\":%llu,"
                   "\"serial\":\"%016llX\",\"version\":\"%u.%u\",\"dirty\":%s,"
                   "\"cluster\":%u}",
@@ -521,4 +532,154 @@ void vfs_close(vfile_t *f) {
   if (f->fd >= 0) close(f->fd);
   f->nf = NULL;
   f->fd = -1;
+}
+
+/* ---- Writing ------------------------------------------------------------- */
+
+int vfs_set_writable(vol_t *v, int on, char *err, size_t errlen) {
+  if (v->kind != VOL_NTFS) {
+    snprintf(err, errlen, "not an NTFS volume");
+    return -EINVAL;
+  }
+  int rc = 0;
+  if (on) rc = ntfs_enable_write(v->ntfs, err, errlen);
+  else ntfs_disable_write(v->ntfs);
+  pthread_mutex_lock(&g_lock);
+  g_gen++;
+  pthread_mutex_unlock(&g_lock);
+  return rc;
+}
+
+/* Split "/a/b/c" into the parent's inode and "c". */
+static int ntfs_parent(vol_t *v, const char *path, uint64_t *parent, char *name,
+                       size_t nlen) {
+  const char *slash = strrchr(path, '/');
+  if (!slash || !slash[1]) return -EINVAL;
+  snprintf(name, nlen, "%s", slash + 1);
+  char dir[1024];
+  size_t dl = (size_t)(slash - path);
+  if (dl >= sizeof dir) return -ENAMETOOLONG;
+  memcpy(dir, path, dl);
+  dir[dl] = 0;
+  return ntfs_lookup(v->ntfs, dl ? dir : "/", parent);
+}
+
+int vfs_mkdir(vol_t *v, const char *path) {
+  if (v->kind == VOL_NTFS) {
+    uint64_t parent;
+    char name[512];
+    int rc = ntfs_parent(v, path, &parent, name, sizeof name);
+    if (!rc) rc = ntfs_mkdir(v->ntfs, parent, name, (int64_t)time(NULL), NULL);
+    return rc;
+  }
+  return mkdir(path, 0777) ? -errno : 0;
+}
+
+int vfs_mkdirs(vol_t *v, const char *path) {
+  char tmp[1024];
+  snprintf(tmp, sizeof tmp, "%s", path);
+  size_t n = strlen(tmp);
+  for (size_t i = 1; i <= n; i++) {
+    if (tmp[i] != '/' && tmp[i] != 0) continue;
+    char c = tmp[i];
+    tmp[i] = 0;
+    ventry_t st;
+    int rc = vfs_stat(v, tmp, &st);
+    if (rc == -ENOENT) rc = vfs_mkdir(v, tmp);
+    else if (!rc && !st.is_dir) rc = -ENOTDIR;
+    if (rc && rc != -EEXIST) return rc;
+    tmp[i] = c;
+  }
+  return 0;
+}
+
+int64_t vfs_free_bytes(vol_t *v, const char *path) {
+  if (v->kind == VOL_NTFS) {
+    uint64_t fr;
+    return ntfs_free_bytes(v->ntfs, &fr) ? -1 : (int64_t)fr;
+  }
+  struct statfs sf;
+  if (statfs(path, &sf)) return -1;
+  return (int64_t)((uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize);
+}
+
+int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
+              vwfile_t *w, uint64_t *done) {
+  memset(w, 0, sizeof *w);
+  w->vol = v;
+  w->fd = -1;
+  w->mtime = mtime;
+  *done = 0;
+  if (v->kind == VOL_NTFS) {
+    uint64_t parent, ino;
+    char name[512];
+    int rc = ntfs_parent(v, path, &parent, name, sizeof name);
+    if (rc) return rc;
+    if (ntfs_lookup(v->ntfs, path, &ino) == 0) {
+      ntfs_stat_t st;
+      rc = ntfs_stat(v->ntfs, ino, &st);
+      if (rc) return rc;
+      if (st.is_dir || st.size != size) return -EEXIST;
+      rc = ntfs_wopen(v->ntfs, ino, &w->nw, done);
+      if (rc == -ENOTSUP) {
+        /* Same size but not ours to continue (e.g. compressed): treat a
+         * same-sized file as already there. */
+        *done = size;
+        return 0;
+      }
+      return rc;
+    }
+    return ntfs_create(v->ntfs, parent, name, size, mtime, &w->nw);
+  }
+
+  struct stat ds;
+  if (stat(path, &ds) == 0) {
+    if (S_ISDIR(ds.st_mode)) return -EEXIST;
+    if ((uint64_t)ds.st_size == size) { *done = size; return 0; }
+  }
+  snprintf(w->final, sizeof w->final, "%s", path);
+  snprintf(w->tmp, sizeof w->tmp, "%s.part", path);
+  w->fd = open(w->tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  return w->fd < 0 ? -errno : 0;
+}
+
+int vfs_wwrite(vwfile_t *w, const void *buf, size_t len) {
+  if (w->nw) return ntfs_wwrite(w->nw, buf, len);
+  const uint8_t *p = buf;
+  while (len) {
+    ssize_t m = write(w->fd, p, len);
+    if (m < 0) {
+      if (errno == EINTR) continue;
+      return -errno;
+    }
+    p += m;
+    len -= (size_t)m;
+  }
+  return 0;
+}
+
+int vfs_wclose(vwfile_t *w, int ok) {
+  int rc = 0;
+  if (w->nw) {
+    rc = ntfs_wclose(w->nw);
+    w->nw = NULL;
+    return rc;
+  }
+  if (w->fd < 0) return 0;
+  if (close(w->fd) && ok) rc = -errno;
+  w->fd = -1;
+  if (!ok || rc) {
+    unlink(w->tmp);
+    return rc;
+  }
+  if (rename(w->tmp, w->final)) {
+    rc = -errno;
+    unlink(w->tmp);
+    return rc;
+  }
+  if (w->mtime > 0) {
+    struct timeval tv[2] = {{(time_t)w->mtime, 0}, {(time_t)w->mtime, 0}};
+    utimes(w->final, tv);
+  }
+  return 0;
 }

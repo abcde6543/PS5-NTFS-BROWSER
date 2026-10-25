@@ -34,6 +34,7 @@ struct bdev {
   uint64_t  size;
   uint32_t  sector;
   int       refs;
+  int       writable;
 
   /* cache, physical devices only */
   pthread_mutex_t lock;
@@ -202,6 +203,95 @@ int bdev_read(bdev_t *b, uint64_t off, void *buf, size_t len) {
   }
   pthread_mutex_unlock(&root->lock);
   return 0;
+}
+
+static int write_full(int fd, uint64_t off, const void *buf, size_t len) {
+  const uint8_t *p = buf;
+  while (len) {
+    ssize_t n = pwrite(fd, p, len, (off_t)off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (n == 0) return -1;
+    p += n; off += (uint64_t)n; len -= (size_t)n;
+  }
+  return 0;
+}
+
+int bdev_enable_write(bdev_t *b) {
+  bdev_t *root = b->parent ? b->parent : b;
+  pthread_mutex_lock(&root->lock);
+  int rc = 0;
+  if (!root->writable) {
+    int fd = open(root->path, O_RDWR);
+    if (fd < 0) {
+      rc = -errno;
+    } else {
+      /* dup2 swaps the descriptor atomically, so reads running in other
+       * threads keep working. */
+      if (dup2(fd, root->fd) < 0) rc = -errno;
+      else root->writable = 1;
+      close(fd);
+    }
+  }
+  pthread_mutex_unlock(&root->lock);
+  return rc;
+}
+
+int bdev_is_writable(const bdev_t *b) {
+  const bdev_t *root = b->parent ? b->parent : b;
+  return root->writable;
+}
+
+/* Copy freshly written bytes into any cached blocks they overlap. */
+static void cache_update(bdev_t *root, uint64_t off, const uint8_t *data, size_t len) {
+  for (int i = 0; i < CACHE_BLOCKS; i++) {
+    cblock_t *c = &root->cache[i];
+    if (!c->valid) continue;
+    uint64_t bs = c->blkno * CACHE_BLOCK, be = bs + CACHE_BLOCK;
+    uint64_t s = off > bs ? off : bs, e = off + len < be ? off + len : be;
+    if (s < e) memcpy(c->data + (s - bs), data + (s - off), (size_t)(e - s));
+  }
+}
+
+int bdev_write(bdev_t *b, uint64_t off, const void *buf, size_t len) {
+  if (off > b->size || len > b->size - off) return -1;
+  if (!len) return 0;
+  bdev_t *root = b;
+  if (b->parent) {
+    root = b->parent;
+    off += b->base;
+  }
+  if (!root->writable) return -1;
+
+  int rc = 0;
+  uint32_t ss = root->sector;
+  pthread_mutex_lock(&root->lock);
+  if (!(off % ss) && !(len % ss)) {
+    rc = write_full(root->fd, off, buf, len);
+    if (!rc) cache_update(root, off, buf, len);
+  } else {
+    uint64_t a0 = off / ss * ss, a1 = (off + len + ss - 1) / ss * ss;
+    size_t span = (size_t)(a1 - a0);
+    uint8_t *tmp = malloc(span);
+    if (!tmp) rc = -1;
+    if (!rc) rc = read_full(root->fd, a0, tmp, span);
+    if (!rc) {
+      memcpy(tmp + (off - a0), buf, len);
+      rc = write_full(root->fd, a0, tmp, span);
+    }
+    if (!rc) cache_update(root, a0, tmp, span);
+    free(tmp);
+  }
+  pthread_mutex_unlock(&root->lock);
+  return rc;
+}
+
+int bdev_flush(bdev_t *b) {
+  bdev_t *root = b->parent ? b->parent : b;
+  if (!root->writable) return 0;
+  return fsync(root->fd) ? -1 : 0;
 }
 
 uint64_t bdev_size(const bdev_t *b) { return b->size; }

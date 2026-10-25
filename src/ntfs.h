@@ -80,6 +80,44 @@ ssize_t ntfs_pread(ntfs_file_t *f, void *buf, size_t len, uint64_t off);
 uint64_t ntfs_file_size(const ntfs_file_t *f);
 void    ntfs_close(ntfs_file_t *f);
 
+/* ---- Writing -------------------------------------------------------------
+ *
+ * Writing is off until ntfs_enable_write() succeeds. It refuses volumes that
+ * Windows did not unmount cleanly (dirty flag, hibernation/Fast Startup,
+ * pending journal), because writing to those can corrupt them.
+ *
+ * Supported: creating folders and files. Files are created with their final
+ * size, then filled sequentially with ntfs_wwrite(); an interrupted file can
+ * be continued with ntfs_wopen(). Existing files are never modified,
+ * deleted or renamed. */
+
+typedef struct ntfs_wfile ntfs_wfile_t;
+
+/* 0 if writing can be enabled; otherwise -errno and a reason in why. */
+int  ntfs_can_write(ntfs_vol_t *v, char *why, size_t len);
+int  ntfs_enable_write(ntfs_vol_t *v, char *err, size_t errlen);
+int  ntfs_is_writable(ntfs_vol_t *v);
+void ntfs_disable_write(ntfs_vol_t *v);
+
+/* Create a folder named name (UTF-8, no '/') in parent. -EEXIST if a file or
+ * folder with that name exists (names compare case-insensitively). */
+int  ntfs_mkdir(ntfs_vol_t *v, uint64_t parent, const char *name, int64_t mtime,
+                uint64_t *inode);
+
+/* Create a file of exactly size bytes; its space is allocated now. */
+int  ntfs_create(ntfs_vol_t *v, uint64_t parent, const char *name, uint64_t size,
+                 int64_t mtime, ntfs_wfile_t **out);
+
+/* Continue writing a partly written file. *done is how much is already
+ * written (equal to the file size when it is complete). */
+int  ntfs_wopen(ntfs_vol_t *v, uint64_t inode, ntfs_wfile_t **out, uint64_t *done);
+
+/* Append data at the current position. Returns 0 or -errno. */
+int  ntfs_wwrite(ntfs_wfile_t *f, const void *buf, size_t len);
+
+/* Record how much was written and release the handle. */
+int  ntfs_wclose(ntfs_wfile_t *f);
+
 /* Exposed for unit tests. Returns decompressed length or -1. */
 ssize_t ntfs_lznt1_decompress(const uint8_t *src, size_t srclen, uint8_t *dst,
                               size_t dstlen);

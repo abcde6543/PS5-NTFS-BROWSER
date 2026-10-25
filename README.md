@@ -1,10 +1,10 @@
 # NTFS Browser for PS5
 
-A file browser payload for jailbroken PS5 consoles that can **read NTFS
-drives**. The PS5 only understands exFAT and FAT32, so an NTFS-formatted USB
-drive normally shows up as unusable. This payload includes its own read-only
-NTFS driver, so you can browse such a drive, preview files and copy them onto
-the console, without reformatting.
+A file browser payload for jailbroken PS5 consoles that can **read and write
+NTFS drives**. The PS5 only understands exFAT and FAT32, so an NTFS-formatted
+USB drive normally shows up as unusable. This payload includes its own NTFS
+driver, so you can browse such a drive, preview files, copy files from it onto
+the console, and copy files from the console onto it, without reformatting.
 
 It runs as a small web server on the console. The interface opens in the PS5's
 own browser (controller friendly), and you can also open it from a phone or PC
@@ -25,11 +25,18 @@ http://<ps5-ip>:8085
   stays fast with tens of thousands of files.
 - **Previews**: images, video and audio (streamed, with seeking), text in
   UTF-8 and UTF-16, and a hex view for binary files.
-- **Copy to PS5**: copy files or whole folders from the NTFS drive to internal
-  storage (`/data/...`) or an exFAT USB drive. Copies run in the background
-  with progress, speed and time remaining, and can be cancelled. The free
-  space is checked before starting. Files that already exist are skipped, so
-  you can resume an interrupted copy.
+- **Copy both ways**: copy files or whole folders from the NTFS drive to
+  internal storage (`/data/...`) or an exFAT USB drive, **or from the console
+  onto the NTFS drive** (e.g. backups, saves, dumps). Copies run in the
+  background with progress, speed and time remaining, and can be cancelled.
+  Free space is checked before starting, and an interrupted copy picks up
+  where it stopped when you start it again.
+  ![Copying from the console onto an NTFS drive](docs/copy-to-usb.png)
+
+- **Write safely**: NTFS drives start **read-only**. Writing is switched on per
+  drive with the lock button, and it is refused on drives Windows didn't
+  unmount cleanly (see [Writing to NTFS](#writing-to-ntfs)).
+- **New folder** on the console or on a writable NTFS drive.
 - **Download** files to a phone or PC through the browser.
 
   ![Copy progress](docs/transfers.png)
@@ -53,11 +60,44 @@ http://<ps5-ip>:8085
 | Encrypted files (EFS) | ❌ listed, but contents can't be read |
 | Symlinks / junctions | shown, not followed |
 | Alternate data streams | ignored (main stream only) |
-| Writing to NTFS | ❌ read-only by design |
+| Creating files and folders on NTFS | ✅ opt-in per drive |
+| Changing, renaming or deleting existing NTFS files | ❌ by design (use a PC) |
 
-The driver never writes to the drive. If Windows wasn't shut down cleanly, the
-most recent changes may still be in the NTFS journal and won't be visible. Use
-"Safely remove" on Windows before unplugging.
+If Windows wasn't shut down cleanly, the most recent changes may still be in
+the NTFS journal and won't be visible. Use "Safely remove" on Windows before
+unplugging.
+
+### Writing to NTFS
+
+Writing is **off until you turn it on** for a drive (the lock button next to
+it, or *Allow writing* in the copy dialog). The writer only ever **adds**
+files and folders: it never changes, renames or deletes anything that is
+already on the drive, so the worst an interruption (say, the drive being
+unplugged mid-copy) can do is leave a partly copied file and a few unused
+clusters, which Windows' `chkdsk` tidies up. Start the same copy again and it
+continues where it stopped.
+
+Writing is refused when the drive isn't in a clean state, because Windows
+would otherwise replay its journal over the new data:
+
+- the volume is marked dirty (Windows crashed or the drive was pulled out),
+- Windows is hibernated on it (Fast Startup), or
+- the NTFS journal has unsaved changes.
+
+Plug the drive into Windows and use *Safely remove* (or shut Windows down
+fully) to fix that.
+
+![Allowing writes on a drive](docs/allow-writing.png)
+
+New files and folders use the same on-disk layout as ntfs-3g, the Linux NTFS
+driver Windows has accepted for many years. Names that Windows can't
+represent (`\ : * ? " < > |`, trailing dots, `CON`, ...) are adjusted
+automatically. Files and folders become readable and writable by everyone.
+
+> **Back up anything irreplaceable first.** The writer is tested heavily (see
+> [Tests](#tests)), but it has not yet been tested by running Windows `chkdsk`
+> on drives it has written. Writing NTFS from a non-Windows system always
+> carries some risk.
 
 ## Requirements
 
@@ -106,7 +146,7 @@ click as well. The gamepad mappings work where the browser exposes the
 Gamepad API.
 
 > **Downloads on the console:** the PS5 browser can't save files. On the
-> console, use **Copy to PS5**; use **Download** from a phone or PC.
+> console, use **Copy to…**; use **Download** from a phone or PC.
 
 ## Building
 
@@ -141,6 +181,10 @@ make host
 ./build/ntfstool cat  my-ntfs.img /some/file.txt
 ./build/ntfstool tree my-ntfs.img
 ./build/ntfstool info my-ntfs.img
+./build/ntfstool check my-ntfs.img                     # consistency check
+./build/ntfstool mkdir  my-ntfs.img /new/folder        # writes!
+./build/ntfstool put    my-ntfs.img local.bin /dir/local.bin
+./build/ntfstool putdir my-ntfs.img ./local-dir /dir/copy
 ```
 
 ### Tests
@@ -157,9 +201,18 @@ sudo make test     # Linux; needs ntfs-3g, attr (setfattr), python3 and /dev/fus
   byte-identical contents for every file. Runs under AddressSanitizer and UBSan.
 - `tests/fuzz.py` corrupts NTFS metadata at random (300 images) and checks
   that damaged drives produce errors, never crashes, hangs or leaks.
+- `tests/write_tests.py` stresses the NTFS **writer**: every cluster size
+  from 512 B to 64 KB, 5,000 files in one folder (deep index B-trees), Unicode
+  and very long names, badly fragmented free space, file-table growth, a full
+  disk, and eight rounds alternating with ntfs-3g. Every result is judged by
+  three independent checks: a structural checker (`ntfstool check`: cluster
+  accounting, MFT bitmap, index order, links), `ntfsresize --check`, and
+  ntfs-3g, which must read back every file by name byte for byte and then
+  modify the same folders itself.
 - `tests/test_server.py` exercises the HTTP API end to end: listing,
-  downloads, byte ranges, keep-alive, 16 parallel streams, copy jobs, resume,
-  cancel, mount and unmount, and the security checks.
+  downloads, byte ranges, keep-alive, 16 parallel streams, copy jobs in both
+  directions, resume after cancel, write protection, refusing dirty drives,
+  mount and unmount, and the security checks.
 
 ## How it works
 
@@ -170,7 +223,8 @@ src/
   api.c        JSON API + file streaming
   vfs.c        one view over console storage and NTFS volumes; device scanning
   jobs.c       background copy queue
-  ntfs.c       the read-only NTFS driver
+  ntfs.c       the NTFS reader
+  ntfs_write.c the NTFS writer (allocation, MFT growth, index B-tree insert)
   part.c       MBR / GPT partition tables
   bdev.c       sector-aligned raw device access with a read cache
   utf.c        UTF-16 <-> UTF-8
@@ -183,7 +237,8 @@ payload opens the device read-only, finds the partitions, and reads NTFS
 structures directly: boot sector → `$MFT` → MFT records (with update-sequence
 fixups) → attributes → data runs. Raw disk devices only allow reads at
 sector-aligned offsets and lengths, so `bdev.c` rounds every read to the
-sector size and keeps an 8 MB block cache.
+sector size and keeps an 8 MB block cache. When you allow writing, the device
+is reopened read-write; partial-sector writes are read-modify-written.
 
 ### API
 
@@ -197,11 +252,12 @@ All responses are JSON unless noted. Requests that change something must be
 | GET | `/api/volinfo` | `vol` |
 | GET | `/api/list` | `vol`, `path` |
 | GET/HEAD | `/api/file` (raw bytes, supports `Range`) | `vol`, `path`, `dl=1` to download |
-| POST | `/api/copy` | `vol`, `path`, `dest` |
+| POST | `/api/copy` | `vol`, `path`, `dvol` (destination drive, default `ps5`), `dest` |
+| POST | `/api/writable` | `vol`, `on=1` / `on=0` |
 | GET | `/api/jobs` | |
 | POST | `/api/jobs/cancel` | `id` |
 | POST | `/api/jobs/clear` | |
-| POST | `/api/rescan`, `/api/mount` (`path`), `/api/unmount` (`vol`), `/api/mkdir` (`path`) | |
+| POST | `/api/rescan`, `/api/mount` (`path`), `/api/unmount` (`vol`), `/api/mkdir` (`vol`, `path`) | |
 
 `vol` is `ps5` for the console's own file system, or the `id` of an NTFS
 volume from `/api/volumes`.
@@ -209,9 +265,10 @@ volume from `/api/volumes`.
 ## Security
 
 While it runs, **anyone on your local network can browse the console's files
-and the NTFS drive, and start copies onto the console**. This is the same as
-FTP payloads. The server never deletes or overwrites anything except files
-inside the copy destination you choose. State-changing requests need a custom
+and the NTFS drive, and start copies onto the console** (and onto NTFS drives
+you have made writable). This is the same as FTP payloads. The server never
+deletes anything, and only overwrites partly copied files inside the copy
+destination you choose. State-changing requests need a custom
 header, so other websites open in the PS5 browser can't trigger them. HTML and
 SVG files from the drive are served as plain text so they can't run scripts.
 Stop the payload, or reboot, when you're done, and don't expose port 8085 to
@@ -224,9 +281,17 @@ the internet.
   **Open image** with the device path (for example `/dev/da0`); browse `/dev`
   under *Root /* to find it. Some USB hubs and enclosures need a moment after
   plugging in, so the app retries several times.
-- **"Volume is dirty".** Windows didn't unmount it cleanly, or Fast Startup
-  hibernated it. Browsing works; to see the latest changes, plug it into
-  Windows and use *Safely remove* (or run `chkdsk`).
+- **"Volume is dirty" / writing refused.** Windows didn't unmount it cleanly,
+  or Fast Startup hibernated it. Browsing and copying *from* the drive work;
+  to write to it, plug it into Windows and use *Safely remove* (or run
+  `chkdsk`, or shut Windows down fully instead of using Fast Startup).
+- **"Too fragmented" when copying to NTFS.** Each new file has to fit its
+  list of disk extents in one file record. On a badly fragmented drive, very
+  large files can exceed that; defragment the drive on Windows, or copy the
+  file to an empty drive.
+- **"A different file already exists".** The destination already has a file
+  with that name but a different size. The writer never replaces files; copy
+  to another folder or delete it on a PC.
 - **"Port 8085 already in use".** Another copy is running. Sending the payload
   again just reopens the browser.
 - **Copy fails with "not enough space".** The total size of the selection is

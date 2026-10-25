@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import struct
 import time
 import urllib.parse
 
@@ -56,7 +57,7 @@ def check(name, cond, detail=""):
 
 def build_image():
     with open(IMG, "wb") as f:
-        f.truncate(96 << 20)
+        f.truncate(192 << 20)
     sh("mkntfs", "-F", "-Q", "-L", "Games & Media", IMG)
     os.makedirs(MNT)
     sh("ntfs-3g", IMG, MNT)
@@ -100,17 +101,63 @@ def main():
             except OSError:
                 time.sleep(0.1)
         run_tests()
+        expect = write_tests()
     finally:
         proc.terminate()
         out = proc.communicate(timeout=5)[0].decode(errors="replace")
         if failures:
             print("--- server output ---\n" + out)
+    verify_offline(expect)
     print()
     if failures:
         print("FAILED:", ", ".join(failures))
         sys.exit(1)
     print("All server tests passed.")
     shutil.rmtree(WORK, ignore_errors=True)
+
+
+def verify_offline(expect):
+    """After the server exits: independent tools must agree the drive is fine."""
+    tool = os.path.join(os.path.dirname(BIN), "ntfstool")
+    r = subprocess.run([tool, "check", IMG], capture_output=True, text=True)
+    check("consistency check after writes", r.returncode == 0, r.stdout + r.stderr)
+    r = subprocess.run(["ntfsresize", "--check", "--force", IMG], capture_output=True, text=True)
+    check("ntfsresize --check after writes", r.returncode == 0, r.stdout + r.stderr)
+    sh("ntfs-3g", "-o", "ro", IMG, MNT)
+    try:
+        ok = True
+        for rel, data in (expect or {}).items():
+            name = rel.replace("video:clip?.mp4", "video_clip_.mp4")
+            with open(os.path.join(MNT, "Backup/PS5", name), "rb") as f:
+                if f.read() != data:
+                    ok = False
+                    break
+        ok = ok and os.path.isdir(os.path.join(MNT, "New Folder/inner"))
+        check("ntfs-3g reads everything we wrote", ok and bool(expect))
+    finally:
+        sh("umount", MNT)
+
+    # A drive Windows didn't unmount cleanly must stay read-only.
+    dirty = os.path.join(WORK, "dirty.img")
+    shutil.copy(IMG, dirty)
+    set_volume_dirty(dirty)
+    p = subprocess.Popen([BIN, "-p", str(PORT + 1), dirty], cwd=WORK,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PORT + 1), 0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        c = http.client.HTTPConnection("127.0.0.1", PORT + 1, timeout=10)
+        c.request("POST", "/api/writable?vol=ntfs0&on=1", headers={"X-NTFSB": "1"})
+        r = c.getresponse()
+        body = json.loads(r.read())
+        check("dirty volume refuses writing", r.status == 409 and "cleanly" in body.get("error", ""), str(body))
+    finally:
+        p.terminate()
+        p.wait()
 
 
 def run_tests():
@@ -271,6 +318,115 @@ def run_tests():
     check("native listing", s == 200 and any(e["n"] == "Big Game" for e in j["entries"]))
     s, h, b = req("GET", "/api/file", {"vol": "ps5", "path": os.path.join(DEST, "Big Game/sub/save.dat")})
     check("native download", s == 200 and b == b"save" * 1000)
+
+
+def set_volume_dirty(img):
+    """Set the 'dirty' flag in $Volume's $VOLUME_INFORMATION, like Windows
+    does when it is shut down uncleanly."""
+    with open(img, "r+b") as f:
+        bs = f.read(512)
+        cl = struct.unpack_from("<H", bs, 11)[0] * bs[13]
+        mft = struct.unpack_from("<Q", bs, 0x30)[0] * cl
+        f.seek(mft + 3 * 1024)
+        r = bytearray(f.read(1024))
+        uo, uc = struct.unpack_from("<HH", r, 4)
+        saved = [bytes(r[i * 512 - 2:i * 512]) for i in range(1, uc)]
+        for i in range(1, uc):
+            r[i * 512 - 2:i * 512] = r[uo + 2 * i:uo + 2 * i + 2]
+        p = struct.unpack_from("<H", r, 0x14)[0]
+        while True:
+            t, l = struct.unpack_from("<II", r, p)
+            if t == 0xFFFFFFFF:
+                raise RuntimeError("no volume information")
+            if t == 0x70:
+                vo = struct.unpack_from("<H", r, p + 20)[0]
+                flags = struct.unpack_from("<H", r, p + vo + 10)[0]
+                struct.pack_into("<H", r, p + vo + 10, flags | 1)
+                break
+            p += l
+        for i in range(1, uc):
+            r[uo + 2 * i:uo + 2 * i + 2] = r[i * 512 - 2:i * 512]
+            r[i * 512 - 2:i * 512] = r[uo:uo + 2]
+        f.seek(mft + 3 * 1024)
+        f.write(r)
+
+
+def write_tests():
+    """PS5 -> NTFS: enable writing, copy a tree onto the drive, resume."""
+    srcdir = os.path.join(WORK, "native-src")
+    os.makedirs(os.path.join(srcdir, "Saves/deep/er"))
+    s, j = jget("/api/volumes")
+    vid = [x for x in j["volumes"] if x["kind"] == "ntfs"][0]["id"]
+    rnd = random.Random(42)
+    expect = {}
+    for i in range(400):
+        rel = "Saves/file_%03d.dat" % i if i % 3 else "Saves/deep/er/f%03d.bin" % i
+        data = rnd.randbytes(rnd.randint(0, 60000))
+        expect[rel] = data
+        open(os.path.join(srcdir, rel), "wb").write(data)
+    big = rnd.randbytes(12_000_000)
+    expect["Saves/video:clip?.mp4"] = big  # name needs sanitising
+    open(os.path.join(srcdir, "Saves/video:clip?.mp4"), "wb").write(big)
+
+    s, j = jget("/api/copy", {"vol": "ps5", "path": srcdir + "/Saves", "dvol": vid, "dest": "/Backup"}, "POST")
+    check("copy to read-only NTFS refused", s == 403, str(j))
+    s, j = jget("/api/mkdir", {"vol": vid, "path": "/x"}, "POST")
+    check("mkdir on read-only NTFS refused", s == 403, str(j))
+
+    s, j = jget("/api/writable", {"vol": vid, "on": "1"}, "POST")
+    v = [x for x in j["volumes"] if x["id"] == vid][0] if s == 200 else {}
+    check("enable writing", s == 200 and v.get("writable") is True, str(j))
+
+    s, j = jget("/api/mkdir", {"vol": vid, "path": "/New Folder/inner"}, "POST")
+    check("mkdir on NTFS (with parents)", s == 200, str(j))
+    s, j = jget("/api/mkdir", {"vol": vid, "path": "/New Folder"}, "POST")
+    check("mkdir existing -> 409", s == 409, str(j))
+
+    s, j = jget("/api/copy", {"vol": "ps5", "path": srcdir + "/Saves", "dvol": vid, "dest": "/Backup/PS5"}, "POST")
+    job = wait_job(j["job"], 120) if s == 200 else None
+    check("PS5 -> NTFS folder copy", job and job["state"] == "done", str(job or j))
+
+    ok = True
+    for rel, data in expect.items():
+        name = rel.replace("video:clip?.mp4", "video_clip_.mp4")
+        s, h, b = req("GET", "/api/file", {"vol": vid, "path": "/Backup/PS5/" + name})
+        if s != 200 or b != data:
+            ok = False
+            print("   mismatch:", name, s, len(b), len(data))
+            break
+    check("written files read back identical (401 files)", ok)
+
+    s, j = jget("/api/copy", {"vol": "ps5", "path": srcdir + "/Saves", "dvol": vid, "dest": "/Backup/PS5"}, "POST")
+    job = wait_job(j["job"], 120)
+    check("re-copy to NTFS skips everything", job["state"] == "done" and job["skipped_files"] == 401, str(job))
+
+    # NTFS -> NTFS on the same drive.
+    s, j = jget("/api/copy", {"vol": vid, "path": "/readme.txt", "dvol": vid, "dest": "/New Folder"}, "POST")
+    job = wait_job(j["job"])
+    check("NTFS -> same NTFS copy", job["state"] == "done", str(job))
+
+    # Interrupted copy resumes from where it stopped.
+    s, j = jget("/api/copy", {"vol": vid, "path": "/big.bin", "dvol": vid, "dest": "/Resume"}, "POST")
+    jid = j["job"]
+    for _ in range(200):
+        s, jj = jget("/api/jobs")
+        cur = [x for x in jj["jobs"] if x["id"] == jid][0]
+        if cur["done_bytes"] > 0 or cur["state"] != "queued" and cur["state"] != "scanning":
+            break
+        time.sleep(0.01)
+    jget("/api/jobs/cancel", {"id": jid}, "POST")
+    first = wait_job(jid)
+    s, j = jget("/api/copy", {"vol": vid, "path": "/big.bin", "dvol": vid, "dest": "/Resume"}, "POST")
+    job = wait_job(j["job"])
+    s, h, b = req("GET", "/api/file", {"vol": vid, "path": "/Resume/big.bin"})
+    ref = random.Random(9).randbytes(30_000_000)
+    check("cancelled copy resumes and completes", job["state"] == "done" and b == ref,
+          "%s / %s" % (first and first["state"], job))
+
+    s, j = jget("/api/writable", {"vol": vid, "on": "0"}, "POST")
+    v = [x for x in j["volumes"] if x["id"] == vid][0]
+    check("make read-only again", v["writable"] is False)
+    return expect
 
 
 def wait_job(jid, timeout=60):
