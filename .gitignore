@@ -1,0 +1,5 @@
+build/
+*.o
+*.part
+*.zip
+__pycache__/
