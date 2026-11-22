@@ -377,7 +377,21 @@ static void *client_main(void *arg) {
       if (read_request(r, carry, &carry_len)) break;
       c.h(r);
       if (!r->sent_headers) http_send_error(r, 500, "no response");
-      if (!r->keep_alive || drain_body(r)) break;
+      if (!r->keep_alive) break;
+      if (drain_body(r)) {
+        /* We answered without reading a large body (e.g. a refused
+         * upload). Stop sending, then keep reading for a moment so the
+         * client gets our response instead of a connection reset. */
+        shutdown(c.fd, SHUT_WR);
+        struct timeval tv = {2, 0};
+        setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char junk[16384];
+        uint64_t total = 0;
+        ssize_t n;
+        while (total < 256ull * 1024 * 1024 && (n = recv(c.fd, junk, sizeof junk, 0)) > 0)
+          total += (uint64_t)n;
+        break;
+      }
     }
   }
   free(r);

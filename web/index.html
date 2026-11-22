@@ -823,8 +823,26 @@ function nextUpload() {
   $("upName").textContent = f.name;
   $("upCount").textContent = (upDone + 1) + " / " + upTotal;
   $("upBar").style.width = "0%";
-  var qs = "vol=" + encodeURIComponent(item.vol) + "&path=" + encodeURIComponent(item.path) +
-    "&name=" + encodeURIComponent(f.name) + (f.lastModified ? "&mtime=" + Math.floor(f.lastModified / 1000) : "");
+  var params = { vol: item.vol, path: item.path, name: f.name };
+  if (f.lastModified) params.mtime = Math.floor(f.lastModified / 1000);
+  var qs = Object.keys(params).map(function (k) { return k + "=" + encodeURIComponent(params[k]); }).join("&");
+  /* Ask first: refused or already-present files aren't sent at all. */
+  var chk = Object.assign({ check: "1", size: f.size }, params);
+  api("/api/upload", chk, "POST").then(function (j) {
+    if (j.skipped) {
+      upDone++;
+      $("upDetail").textContent = f.name + " is already there";
+      nextUpload();
+      return;
+    }
+    sendUpload(f, qs, t0);
+  }).catch(function (e) {
+    upDone++; upFailed++;
+    toast(f.name + ": " + e.message, true);
+    nextUpload();
+  });
+}
+function sendUpload(f, qs, t0) {
   var xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/upload?" + qs);
   xhr.setRequestHeader("X-NTFSB", "1");

@@ -478,6 +478,37 @@ static void route_upload(http_req_t *r) {
   snprintf(full, sizeof full, "%s/%s", strcmp(dir, "/") ? dir : "", name);
   vwfile_t w;
   uint64_t done = 0;
+
+  /* ?check=1&size=N: say whether an upload would be accepted, before the
+   * browser starts sending a possibly huge body. */
+  char chk[4] = "", sz[32] = "";
+  http_param(r, "check", chk, sizeof chk);
+  if (chk[0] == '1') {
+    http_param(r, "size", sz, sizeof sz);
+    uint64_t want = strtoull(sz, NULL, 10);
+    if (!rc) {
+      int64_t fr = vfs_free_bytes(v, dir);
+      if (fr >= 0 && (uint64_t)fr < want) { rc = -ENOSPC; msg = "not enough free space"; }
+    }
+    if (!rc) {
+      rc = vfs_wcheck(v, full, want, mt[0] ? atoll(mt) : 0, &done);
+      if (rc == -EEXIST) msg = "a different file with that name already exists";
+    }
+    vfs_put(v);
+    if (rc) {
+      http_send_error(r, err_status(rc), msg ? msg : err_text(rc));
+      return;
+    }
+    buf_t b;
+    buf_init(&b);
+    buf_puts(&b, "{\"name\":");
+    buf_json_str(&b, name);
+    buf_printf(&b, ",\"present\":%llu,\"skipped\":%s}", (unsigned long long)done,
+               want && done >= want ? "true" : "false");
+    http_send_json(r, 200, &b);
+    buf_free(&b);
+    return;
+  }
   if (!rc) {
     rc = vfs_wopen(v, full, r->content_length, mt[0] ? atoll(mt) : 0, &w, &done);
     if (rc == -EEXIST) msg = "a different file with that name already exists";

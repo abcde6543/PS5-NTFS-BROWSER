@@ -120,6 +120,10 @@ typedef struct vwfile {
 int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
               vwfile_t *w, uint64_t *done);
 int vfs_wwrite(vwfile_t *w, const void *buf, size_t len);
+
+/* What vfs_wopen would do, without creating anything: 0 with *done set
+ * (*done == size: already there), or -EEXIST. */
+int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_t *done);
 /* ok = 0 abandons the file (native: removes the partial copy). */
 int vfs_wclose(vwfile_t *w, int ok);
 

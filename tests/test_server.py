@@ -146,6 +146,16 @@ def v13_tests(expect):
     check("re-upload of same file skipped", st == 200 and j.get("skipped") is True, str(j))
     st, j = upload(vid, "/Uploads", "tiny.txt", b"different!")
     check("upload over a different file refused", st == 409, str(j))
+    s, j = jget("/api/upload", {"vol": vid, "path": "/Uploads", "name": "tiny.txt", "size": "2", "check": "1"}, "POST")
+    check("upload pre-check: already there", s == 200 and j.get("skipped") is True, str(j))
+    s, j = jget("/api/upload", {"vol": vid, "path": "/Uploads", "name": "tiny.txt", "size": "9", "check": "1"}, "POST")
+    check("upload pre-check: name clash", s == 409, str(j))
+    s, j = jget("/api/upload", {"vol": vid, "path": "/Uploads", "name": "new.bin", "size": "99", "check": "1"}, "POST")
+    check("upload pre-check: new file ok, nothing created",
+          s == 200 and j.get("present") == 0 and
+          "new.bin" not in {e["n"] for e in jget("/api/list", {"vol": vid, "path": "/Uploads"})[1]["entries"]}, str(j))
+    s, j = jget("/api/upload", {"vol": vid, "path": "/Uploads", "name": "huge.bin", "size": str(10**15), "check": "1"}, "POST")
+    check("upload pre-check: too big -> 507", s == 507, str(j))
     st, j = upload(vid, "/nope", "x.txt", b"x")
     check("upload into missing folder -> 404", st == 404, str(j))
 

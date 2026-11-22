@@ -822,3 +822,28 @@ void vfs_safe_name(char *dst, size_t len, const char *src) {
   snprintf(dst, len, "%s", tmp);
 }
 
+
+int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_t *done) {
+  *done = 0;
+  if (v->kind == VOL_NTFS) {
+    uint64_t ino;
+    if (ntfs_lookup(v->ntfs, path, &ino)) return 0; /* new file */
+    ntfs_stat_t st;
+    int rc = ntfs_stat(v->ntfs, ino, &st);
+    if (rc) return rc;
+    if (st.is_dir || st.size != size) return -EEXIST;
+    ntfs_wfile_t *w;
+    rc = ntfs_wopen(v->ntfs, ino, &w, done);
+    if (rc == -ENOTSUP) { *done = size; return 0; }
+    if (rc) return rc;
+    ntfs_wclose(w);
+    if (*done < size && mtime > 0 && st.mtime != mtime) { *done = 0; return -EEXIST; }
+    return 0;
+  }
+  struct stat ds;
+  if (stat(path, &ds) == 0) {
+    if (S_ISDIR(ds.st_mode)) return -EEXIST;
+    if ((uint64_t)ds.st_size == size) *done = size;
+  }
+  return 0;
+}
