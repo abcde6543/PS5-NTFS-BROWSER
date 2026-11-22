@@ -193,6 +193,33 @@ def v13_tests(expect):
     s, j = jget("/api/search", {"vol": vid, "path": "/", "q": ""})
     check("empty search -> 400", s == 400)
 
+    # Delete (v1.4): a file, then a whole folder tree, as background jobs.
+    st, j = upload(vid, "/Uploads", "delete-me.txt", b"bye")
+    s, j = jget("/api/delete", {"vol": vid, "path": "/Uploads/delete-me.txt"}, "POST")
+    job = wait_job(j.get("job", -1)) if s == 200 else None
+    s2, j2 = jget("/api/list", {"vol": vid, "path": "/Uploads"})
+    check("delete a file", job and job["state"] == "done" and job["kind"] == "delete" and
+          "delete-me.txt" not in {e["n"] for e in j2["entries"]}, str(job or j))
+    s, j = jget("/api/delete", {"vol": vid, "path": "/Backup/PS5/Saves/deep"}, "POST")
+    job = wait_job(j.get("job", -1), 120) if s == 200 else None
+    s2, j2 = jget("/api/list", {"vol": vid, "path": "/Backup/PS5/Saves"})
+    check("delete a folder tree", job and job["state"] == "done" and job["done_files"] > 100 and
+          "deep" not in {e["n"] for e in j2["entries"]}, str(job or j))
+    for k in [k for k in expect if k.startswith("Saves/deep/")]:
+        del expect[k]
+    s, j = jget("/api/delete", {"vol": vid, "path": "/"}, "POST")
+    check("deleting the drive root refused", s == 403, str(j))
+    s, j = jget("/api/delete", {"vol": "ps5", "path": WORK + "/up-native/pic.png"}, "POST")
+    check("deleting on console storage refused", s == 409 and os.path.exists(os.path.join(WORK, "up-native/pic.png")), str(j))
+    s, j = jget("/api/delete", {"vol": vid, "path": "/nope.txt"}, "POST")
+    check("deleting a missing file -> 404", s == 404, str(j))
+    jget("/api/writable", {"vol": vid, "on": "0"}, "POST")
+    s, j = jget("/api/delete", {"vol": vid, "path": "/Uploads/tiny.txt"}, "POST")
+    check("delete on read-only drive refused", s == 403, str(j))
+    jget("/api/writable", {"vol": vid, "on": "1"}, "POST")
+    s, j = jget("/api/delete", {"vol": "ps5", "path": "x"}, "GET")
+    check("delete via GET refused", s == 405)
+
     # Eject flushes and unmounts; the image must be consistent right away.
     s, j = jget("/api/eject", {"vol": vid}, "POST")
     check("eject", s == 200 and not [x for x in j["volumes"] if x["kind"] == "ntfs"], str(j))
@@ -264,6 +291,8 @@ def verify_offline(expect):
                     ok = False
                     break
         ok = ok and os.path.isdir(os.path.join(MNT, "New Folder/inner"))
+        ok = ok and not os.path.exists(os.path.join(MNT, "Backup/PS5/Saves/deep"))
+        ok = ok and not os.path.exists(os.path.join(MNT, "Uploads/delete-me.txt"))
         check("ntfs-3g reads everything we wrote", ok and bool(expect))
     finally:
         sh("umount", MNT)

@@ -102,6 +102,9 @@ int vfs_mkdir(vol_t *v, const char *path);
 /* Make sure a folder and its parents exist. */
 int vfs_mkdirs(vol_t *v, const char *path);
 
+/* Delete a file or an empty folder (NTFS drives only). */
+int vfs_delete(vol_t *v, const char *path);
+
 /* Free bytes on the volume that holds path (-1 if unknown). */
 int64_t vfs_free_bytes(vol_t *v, const char *path);
 

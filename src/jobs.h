@@ -13,6 +13,10 @@ void jobs_init(void);
 int jobs_copy(const char *vol, const char *src, const char *dvol, const char *dest_dir,
               char *err, size_t errlen);
 
+/* Queue deleting vol:path (a file, or a folder with everything in it) from
+ * a writable NTFS drive. Returns the job id or -errno with a message. */
+int jobs_delete(const char *vol, const char *path, char *err, size_t errlen);
+
 int  jobs_cancel(int id);
 
 /* 1 if a queued or running job reads from or writes to this volume. */

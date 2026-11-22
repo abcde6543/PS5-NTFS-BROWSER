@@ -7,6 +7,8 @@
  *   ntfstool mkdir <image> <path>  (creates parents too)
  *   ntfstool put <image> <local-file> <path>
  *   ntfstool putdir <image> <local-dir> <path>   (recursive copy in)
+ *   ntfstool rm <image> <path>     (file or empty folder)
+ *   ntfstool rmtree <image> <path> (folder and everything in it)
  *   ntfstool check <image>         (consistency check, exit 1 on errors)
  *
  * <image> may be a raw partition image or a whole-disk image with an MBR or
@@ -183,6 +185,35 @@ static int put_dir(ntfs_vol_t *v, const char *local, const char *path) {
   return rc;
 }
 
+static int rm_path(ntfs_vol_t *v, const char *path) {
+  uint64_t parent;
+  const char *base;
+  int rc = split_parent(v, path, &parent, &base);
+  return rc ? rc : ntfs_unlink(v, parent, base);
+}
+
+static int rm_tree(ntfs_vol_t *v, const char *path) {
+  uint64_t ino;
+  ntfs_stat_t st;
+  int rc = ntfs_lookup(v, path, &ino);
+  if (!rc) rc = ntfs_stat(v, ino, &st);
+  if (rc) return rc;
+  if (st.is_dir) {
+    clist_t l = {0};
+    rc = ntfs_readdir(v, ino, collect, &l);
+    for (size_t i = 0; i < l.n; i++) {
+      char child[4096];
+      snprintf(child, sizeof child, "%s/%s", path, l.c[i].name);
+      if (!rc) rc = rm_tree(v, child);
+      if (rc) fprintf(stderr, "%s: %s\n", child, strerror(-rc));
+      free(l.c[i].name);
+    }
+    free(l.c);
+    if (rc) return rc;
+  }
+  return rm_path(v, path);
+}
+
 /* ---- consistency checker ---- */
 
 static int g_errors;
@@ -239,6 +270,94 @@ static int present_cb(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen
   (void)fn; (void)fnlen;
   if (MREF(ref) == p->ino) { p->found = 1; return 1; }
   return 0;
+}
+
+/* B-tree shape of one directory index: leaves at one depth, no empty
+ * nodes below the root, a child pointer on every entry of inner nodes, and
+ * index blocks consistent with the index bitmap. */
+typedef struct tree_chk {
+  ntfs_vol_t *v;
+  uint64_t dir;
+  attr_t ia;
+  uint32_t ibs, unit;
+  int leaf_depth;
+  uint8_t *used;   /* blocks reached */
+  uint64_t nblocks;
+} tree_chk_t;
+
+static void tree_node(tree_chk_t *t, const uint8_t *p, const uint8_t *end, int depth, int is_root, int64_t self) {
+  int real = 0, subs = 0, entries = 0;
+  for (; p + 16 <= end; ) {
+    uint16_t len = le16(p + 8), fl = le16(p + 12);
+    if (len < 16 || p + len > end) { CHK("dir %llu: bad index entry", (unsigned long long)t->dir); return; }
+    entries++;
+    if (fl & 1) {
+      subs++;
+      uint64_t vcn = le64(p + len - 8);
+      uint64_t b = vcn * t->unit / t->ibs;
+      if (b >= t->nblocks) { CHK("dir %llu: sub-node beyond allocation", (unsigned long long)t->dir); return; }
+      if (t->used[b]) { CHK("dir %llu: index block %llu reached twice", (unsigned long long)t->dir, (unsigned long long)b); return; }
+      t->used[b] = 1;
+      uint8_t *blk = malloc(t->ibs);
+      if (attr_pread(t->v, &t->ia, vcn * t->unit, blk, t->ibs) != (ssize_t)t->ibs || memcmp(blk, "INDX", 4) ||
+          apply_fixups(blk, t->ibs)) {
+        CHK("dir %llu: unreadable index block %llu", (unsigned long long)t->dir, (unsigned long long)b);
+      } else {
+        if (le64(blk + 0x10) != vcn) CHK("dir %llu: block %llu has wrong VCN", (unsigned long long)t->dir, (unsigned long long)b);
+        const uint8_t *h = blk + 0x18;
+        int is_internal = h[12] & 1;
+        (void)is_internal;
+        tree_node(t, h + le32(h), h + le32(h + 4), depth + 1, 0, (int64_t)vcn);
+      }
+      free(blk);
+    }
+    if (fl & 2) break;
+    real++;
+    p += len;
+  }
+  if (subs && subs != entries) CHK("dir %llu: inner node with entries lacking children", (unsigned long long)t->dir);
+  if (!is_root && real == 0)
+    CHK("dir %llu: empty index node below the root (vcn %lld, depth %d, %d entries)",
+        (unsigned long long)t->dir, (long long)self, depth, entries);
+  if (!subs) {
+    if (t->leaf_depth < 0) t->leaf_depth = depth;
+    else if (t->leaf_depth != depth && !(is_root && real == 0))
+      CHK("dir %llu: leaves at different depths (%d vs %d)", (unsigned long long)t->dir, t->leaf_depth, depth);
+  }
+}
+
+static void check_tree(ntfs_vol_t *v, uint64_t dir) {
+  attr_t root;
+  if (attr_find(v, dir, 0x90, I30, 4, &root)) return;
+  tree_chk_t t;
+  memset(&t, 0, sizeof t);
+  t.v = v;
+  t.dir = dir;
+  t.leaf_depth = -1;
+  t.ibs = le32(root.data + 8);
+  t.unit = v->cluster <= t.ibs ? v->cluster : 512;
+  int has_ia = attr_find(v, dir, 0xA0, I30, 4, &t.ia) == 0;
+  t.nblocks = has_ia ? t.ia.size / t.ibs : 0;
+  t.used = calloc(1, (size_t)t.nblocks + 1);
+  const uint8_t *h = root.data + 16;
+  tree_node(&t, h + le32(h), h + le32(h + 4), 0, 1, -1);
+  if (has_ia) {
+    attr_t bm;
+    if (attr_find(v, dir, 0xB0, I30, 4, &bm) == 0) {
+      uint8_t *bits = calloc(1, (size_t)bm.size + 1);
+      attr_pread(v, &bm, 0, bits, (size_t)bm.size);
+      for (uint64_t b = 0; b < t.nblocks; b++) {
+        int marked = b / 8 < bm.size && ((bits[b / 8] >> (b % 8)) & 1);
+        if (t.used[b] && !marked) CHK("dir %llu: index block %llu in use but free in bitmap", (unsigned long long)dir, (unsigned long long)b);
+        if (!t.used[b] && marked) CHK("dir %llu: index block %llu marked but unused", (unsigned long long)dir, (unsigned long long)b);
+      }
+      free(bits);
+      attr_free(&bm);
+    }
+    attr_free(&t.ia);
+  }
+  free(t.used);
+  attr_free(&root);
 }
 
 static int check_volume(ntfs_vol_t *v) {
@@ -318,6 +437,7 @@ static int check_volume(ntfs_vol_t *v) {
       ord_ctx_t o = {0};
       o.v = v; o.dir = i; o.rec = rec2;
       if (index_walk(v, i, ord_cb, &o)) CHK("dir %llu: index walk failed", (unsigned long long)i);
+      check_tree(v, i);
     }
     if (i >= 16 || i == 5) {
       pos = 0;
@@ -387,6 +507,11 @@ int main(int argc, char **argv) {
   } else if (!strcmp(cmd, "tree")) {
     tree_ctx_t t = {v, "", 0};
     tree(&t, NTFS_ROOT_INODE);
+  } else if (!strcmp(cmd, "rm") || !strcmp(cmd, "rmtree")) {
+    char err[256];
+    rc = ntfs_enable_write(v, err, sizeof err);
+    if (rc) fprintf(stderr, "enable write: %s\n", err);
+    else rc = !strcmp(cmd, "rm") ? rm_path(v, path) : rm_tree(v, path);
   } else if (!strcmp(cmd, "mkdir") || !strcmp(cmd, "put") || !strcmp(cmd, "putdir")) {
     char err[256];
     rc = ntfs_enable_write(v, err, sizeof err);

@@ -29,6 +29,7 @@ static const char *state_names[] = {"queued", "scanning", "copying", "done",
 
 typedef struct job {
   int      id;
+  int      is_delete;    /* 0 = copy, 1 = delete */
   jstate_t state;
   char     vol[16];
   char     dvol[16];     /* destination volume */
@@ -221,7 +222,89 @@ static int copy_tree(job_t *j, vol_t *v, vol_t *dv, const char *src, const char 
   return rc;
 }
 
+/* ---- Delete --------------------------------------------------------------- */
+
+static const char *delete_error(int rc) {
+  switch (-rc) {
+    case ENOTSUP:   return "Windows tracks this file elsewhere (link tracking, reparse "
+                           "point or other hard links); delete it on a PC";
+    case EPERM:     return "system files can't be deleted";
+    case ENOTEMPTY: return "folder not empty";
+    case EROFS:     return "the drive is read-only";
+    default:        return NULL;
+  }
+}
+
+static int delete_tree(job_t *j, vol_t *v, const char *path, int depth) {
+  if (j->cancel) return -ECANCELED;
+  if (depth > 64) return -ELOOP;
+  ventry_t st;
+  int rc = vfs_stat(v, path, &st);
+  if (rc) { fail(j, "cannot read %s", path, -rc); return rc; }
+  pthread_mutex_lock(&g_lock);
+  snprintf(j->current, sizeof j->current, "%s", path);
+  pthread_mutex_unlock(&g_lock);
+  if (st.is_dir && !st.is_link) {
+    vlist_t l;
+    if ((rc = vfs_list(v, path, &l))) { fail(j, "cannot list %s", path, -rc); return rc; }
+    char child[2048];
+    for (size_t i = 0; i < l.n && !rc; i++) {
+      if (join(child, sizeof child, path, l.e[i].name)) { rc = -ENAMETOOLONG; break; }
+      rc = delete_tree(j, v, child, depth + 1);
+    }
+    vfs_list_free(&l);
+    if (rc) return rc;
+  }
+  rc = vfs_delete(v, path);
+  if (rc) {
+    const char *why = delete_error(rc);
+    char msg[200];
+    snprintf(msg, sizeof msg, "cannot delete %%s: %s", why ? why : strerror(-rc));
+    fail(j, msg, path, 0);
+    return rc;
+  }
+  pthread_mutex_lock(&g_lock);
+  if (!st.is_dir) {
+    j->done_files++;
+    j->done_bytes += st.size;
+  }
+  pthread_mutex_unlock(&g_lock);
+  return 0;
+}
+
+static void run_delete(job_t *j) {
+  vol_t *v = vfs_get(j->vol);
+  if (!v) {
+    fail(j, "volume %s is no longer available", j->vol, 0);
+    set_state(j, J_FAILED);
+    return;
+  }
+  int rc = 0;
+  if (v->kind == VOL_NTFS && !ntfs_is_writable(v->ntfs)) {
+    fail(j, "the drive is read-only", "", 0);
+    rc = -EROFS;
+  }
+  set_state(j, J_SCANNING);
+  if (!rc) rc = scan(j, v, v, j->src, NULL, 0);
+  if (!rc) {
+    set_state(j, J_COPYING);
+    rc = delete_tree(j, v, j->src, 0);
+  }
+  vfs_put(v);
+  pthread_mutex_lock(&g_lock);
+  j->finished = now_ms();
+  j->current[0] = 0;
+  j->state = rc == -ECANCELED || j->cancel ? J_CANCELLED : rc ? J_FAILED : J_DONE;
+  pthread_mutex_unlock(&g_lock);
+}
+
+static int jobs_add(job_t *j, char *err, size_t errlen);
+
 static void run_job(job_t *j) {
+  if (j->is_delete) {
+    run_delete(j);
+    return;
+  }
   vol_t *v = vfs_get(j->vol);
   if (!v) {
     fail(j, "volume %s is no longer available", j->vol, 0);
@@ -353,8 +436,43 @@ int jobs_copy(const char *vol, const char *src, const char *dvol, const char *de
   snprintf(j->dvol, sizeof j->dvol, "%s", dvol);
   snprintf(j->src, sizeof j->src, "%s", src);
   snprintf(j->dest, sizeof j->dest, "%s", dest_dir);
-  j->state = J_QUEUED;
+  return jobs_add(j, err, errlen);
+}
 
+int jobs_delete(const char *vol, const char *path, char *err, size_t errlen) {
+  vol_t *v = vfs_get(vol);
+  if (!v) {
+    snprintf(err, errlen, "drive not found");
+    return -ENOENT;
+  }
+  int rc = 0;
+  ventry_t st;
+  if (v->kind != VOL_NTFS) {
+    snprintf(err, errlen, "deleting is only available on NTFS drives");
+    rc = -ENOTSUP;
+  } else if (!ntfs_is_writable(v->ntfs)) {
+    snprintf(err, errlen, "the drive is read-only");
+    rc = -EROFS;
+  } else if (!strcmp(path, "/")) {
+    snprintf(err, errlen, "the whole drive can't be deleted");
+    rc = -EPERM;
+  } else if (vfs_stat(v, path, &st)) {
+    snprintf(err, errlen, "not found: %s", path);
+    rc = -ENOENT;
+  }
+  vfs_put(v);
+  if (rc) return rc;
+  job_t *j = calloc(1, sizeof *j);
+  if (!j) { snprintf(err, errlen, "out of memory"); return -ENOMEM; }
+  j->is_delete = 1;
+  snprintf(j->vol, sizeof j->vol, "%s", vol);
+  snprintf(j->dvol, sizeof j->dvol, "%s", vol);
+  snprintf(j->src, sizeof j->src, "%s", path);
+  return jobs_add(j, err, errlen);
+}
+
+static int jobs_add(job_t *j, char *err, size_t errlen) {
+  j->state = J_QUEUED;
   pthread_mutex_lock(&g_lock);
   int slot = -1;
   for (int i = 0; i < MAX_JOBS && slot < 0; i++)
@@ -432,7 +550,8 @@ void jobs_json(buf_t *b) {
     if (!first) buf_puts(b, ",");
     first = 0;
     int64_t elapsed = j->started ? (j->finished ? j->finished : now) - j->started : 0;
-    buf_printf(b, "{\"id\":%d,\"state\":\"%s\",\"vol\":", j->id, state_names[j->state]);
+    buf_printf(b, "{\"id\":%d,\"kind\":\"%s\",\"state\":\"%s\",\"vol\":", j->id,
+               j->is_delete ? "delete" : "copy", state_names[j->state]);
     buf_json_str(b, j->vol);
     buf_puts(b, ",\"src\":");
     buf_json_str(b, j->src);

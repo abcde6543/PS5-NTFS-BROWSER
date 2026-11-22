@@ -36,6 +36,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover { background: var(--accent-2); }
+button.danger { color: var(--bad); }
+button.danger:hover { border-color: var(--bad); }
+button.danger-fill { background: var(--bad); border-color: var(--bad); color: #fff; }
+button.danger-fill:hover { background: #ff7a70; }
+.brand .grow { flex: 1; }
+.dellist { max-height: 160px; overflow: auto; margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
 button.ghost { background: transparent; border-color: transparent; }
 button.ghost:hover { background: var(--panel-2); border-color: var(--line); }
 button:disabled { opacity: .45; cursor: default; }
@@ -129,7 +135,7 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
 #list { flex: 1; overflow-y: auto; position: relative; outline: none; }
 #spacer { position: relative; width: 100%; }
 .row { position: absolute; left: 0; right: 0; height: var(--row); display: grid;
-  grid-template-columns: 36px 30px minmax(0,1fr) 110px 150px 92px; align-items: center; gap: 6px;
+  grid-template-columns: 36px 30px minmax(0,1fr) 110px 150px 124px; align-items: center; gap: 6px;
   padding: 0 12px; border-bottom: 1px solid rgba(35,48,73,.55); cursor: pointer; user-select: none; }
 .row:hover { background: rgba(23,32,51,.7); }
 .row.cur { background: rgba(47,124,246,.13); box-shadow: inset 3px 0 0 var(--accent); }
@@ -156,7 +162,7 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
 .k-pkg { color: #3dd6f5; background: rgba(61,214,245,.12); }
 .k-bin { color: var(--muted); background: rgba(139,152,174,.12); }
 .head { position: sticky; top: 0; z-index: 2; height: 34px; display: grid;
-  grid-template-columns: 36px 30px minmax(0,1fr) 110px 150px 92px; gap: 6px; align-items: center;
+  grid-template-columns: 36px 30px minmax(0,1fr) 110px 150px 124px; gap: 6px; align-items: center;
   padding: 0 12px; background: var(--bg); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .head button { border: none; background: transparent; padding: 4px 0; color: inherit; font-size: 12px; }
 .head .r { justify-content: flex-end; }
@@ -241,6 +247,8 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
     <div class="brand">
       <div class="logo"><svg class="i" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
       <div><b>NTFS Browser</b><small id="ver">PS5 file browser</small></div>
+      <span class="grow"></span>
+      <button id="setBtn" class="ghost" title="Settings"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
     </div>
     <div id="vols"></div>
     <div class="side-foot">
@@ -266,6 +274,7 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
       <button id="uploadBtn" class="ghost" style="display:none" title="Upload files from this device"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg>Upload</button>
       <input type="file" id="fileInput" multiple style="display:none">
       <button id="mkdirBtn" class="ghost" style="display:none"><svg class="i" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 10v6M9 13h6"/></svg>New folder</button>
+      <button id="delBtn" class="danger" style="display:none" disabled title="Delete from the drive (Delete key)"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>Delete</button>
       <button id="dlSelBtn" disabled><svg class="i" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Download</button>
       <button id="copySelBtn" class="primary" disabled><svg class="i" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>Copy to…</button>
     </div>
@@ -347,6 +356,26 @@ label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--mu
   <footer><button data-close>Cancel</button><button class="primary" id="mkGo">Create</button></footer>
 </div></div>
 
+<div class="overlay" id="delO"><div class="dialog">
+  <header><h2>Delete permanently?</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
+  <div class="body">
+    <p id="delWhat"></p>
+    <ul class="dellist" id="delList"></ul>
+    <div class="warnbox" style="margin-top:14px">Deleted files are removed from the drive straight away. There is <b>no recycle bin</b> and they can't be recovered here.</div>
+    <p class="note">This question is asked <b>only once</b> on this device. After this, Delete works immediately. You can turn the question back on in Settings (gear icon).</p>
+  </div>
+  <footer><button data-close>Cancel</button><button class="danger-fill" id="delGo">Delete</button></footer>
+</div></div>
+
+<div class="overlay" id="setO"><div class="dialog">
+  <header><h2>Settings</h2><button class="ghost" data-close><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
+  <div class="body">
+    <label class="chk" style="color:var(--text);font-size:15px"><input type="checkbox" id="setAskDel"> Ask before every delete</label>
+    <p class="note" style="margin-top:8px">Off by default after the first confirmation. Settings are saved in this browser only.</p>
+  </div>
+  <footer><button class="primary" data-close>Done</button></footer>
+</div></div>
+
 <div id="upPanel"><div class="t"><b id="upName"></b><span id="upCount"></span></div>
   <div class="s" id="upDetail"></div><div class="bar"><i id="upBar"></i></div></div>
 
@@ -374,6 +403,7 @@ var ICON = {
   dl: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   eject: '<path d="M12 5l7 8H5zM5 19h14"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
   lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   unlock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/>',
@@ -672,7 +702,9 @@ function paint() {
       '<span class="sz">' + (e.d ? "" : fmtSize(e.s)) + '</span>' +
       '<span class="dt">' + fmtDate(e.t) + '</span>' +
       '<span class="acts">' + (e.d ? "" : '<button class="ghost" data-act="dl" title="Download">' + svg("dl") + '</button>') +
-      '<button class="ghost" data-act="copy" title="Copy to…">' + svg("copy") + '</button></span></div>');
+      '<button class="ghost" data-act="copy" title="Copy to…">' + svg("copy") + '</button>' +
+      (canDelete() ? '<button class="ghost danger" data-act="del" title="Delete">' + svg("trash") + '</button>' : "") +
+      '</span></div>');
   }
   spacer.innerHTML = h.join("");
 }
@@ -702,6 +734,7 @@ spacer.addEventListener("click", function (ev) {
     if (a === "sel") toggleSel(e);
     else if (a === "dl") download([e]);
     else if (a === "copy") openCopy([e]);
+    else if (a === "del") deleteItems([e]);
     paint();
     return;
   }
@@ -730,6 +763,7 @@ function updateSel() {
   var bytes = files.reduce(function (a, e) { return a + e.s; }, 0);
   $("selInfo").textContent = s.length ? s.length + " selected" + (files.length ? " · " + fmtSize(bytes) : "") : "";
   $("copySelBtn").disabled = !s.length;
+  $("delBtn").disabled = !s.length;
   $("dlSelBtn").disabled = !files.length;
   $("selAllBtn").textContent = s.length && s.length === S.view.length ? "Select none" : "Select all";
 }
@@ -892,6 +926,59 @@ $("fileInput").addEventListener("change", function () {
     uploadFiles(ev.dataTransfer.files, S.vol, S.path);
   });
 })();
+
+/* ---------- delete (NTFS drives) ---------- */
+var delItems = [];
+function askBeforeDelete() {
+  try { return localStorage.getItem("ntfsb.delConfirmed") !== "1"; } catch (e) { return true; }
+}
+function deleteItems(items) {
+  if (!items.length || !canDelete()) return;
+  delItems = items.slice();
+  if (!askBeforeDelete()) { runDelete(); return; }
+  var files = items.filter(function (e) { return !e.d; }), dirs = items.length - files.length;
+  $("delWhat").innerHTML = items.length === 1 ? "Delete <b>" + esc(items[0].n) + "</b>" + (items[0].d ? " and everything in it?" : "?") :
+    "Delete <b>" + items.length + " items</b>" + (dirs ? " (" + dirs + " folder(s) with everything in them)" : "") + "?";
+  $("delList").innerHTML = items.slice(0, 50).map(function (e) { return "<li>" + esc(e.n) + (e.d ? "/" : "") + "</li>"; }).join("") +
+    (items.length > 50 ? "<li>… and " + (items.length - 50) + " more</li>" : "");
+  show("delO");
+}
+$("delGo").addEventListener("click", function () {
+  try { localStorage.setItem("ntfsb.delConfirmed", "1"); } catch (e) {}
+  hide("delO");
+  runDelete();
+});
+function runDelete() {
+  var vol = S.vol, base = S.path, items = delItems.slice(), n = 0, failed = 0;
+  (function next() {
+    if (n >= items.length) {
+      S.sel = {}; paint(); updateSel();
+      if (items.length - failed) toast("Deleting " + (items.length - failed) + " item(s)…");
+      pollJobs();
+      return;
+    }
+    var e = items[n++];
+    api("/api/delete", { vol: vol, path: joinPath(base, e.n) }, "POST").then(function (j) {
+      lastJobState[j.job] = "queued"; /* so finishing before the next poll still counts */
+      next();
+    }).catch(function (err) {
+      failed++;
+      toast(e.n + ": " + err.message, true);
+      next();
+    });
+  })();
+}
+$("delBtn").addEventListener("click", function () { deleteItems(selected()); });
+$("setBtn").addEventListener("click", function () {
+  $("setAskDel").checked = askBeforeDelete();
+  show("setO");
+});
+$("setAskDel").addEventListener("change", function () {
+  try {
+    if (this.checked) localStorage.removeItem("ntfsb.delConfirmed");
+    else localStorage.setItem("ntfsb.delConfirmed", "1");
+  } catch (e) {}
+});
 
 /* ---------- toolbar ---------- */
 $("filter").addEventListener("input", function () {
@@ -1135,7 +1222,10 @@ function startCopy() {
       return;
     }
     var e = items[n++];
-    api("/api/copy", { vol: vol, path: joinPath(base, e.n), dvol: dvol, dest: dest }, "POST").then(next).catch(function (err) {
+    api("/api/copy", { vol: vol, path: joinPath(base, e.n), dvol: dvol, dest: dest }, "POST").then(function (j) {
+      lastJobState[j.job] = "queued";
+      next();
+    }).catch(function (err) {
       $("cpGo").disabled = false;
       $("cpErr").textContent = err.message;
     });
@@ -1188,7 +1278,12 @@ $("wrGo").addEventListener("click", function () {
 });
 
 /* ---------- new folder ---------- */
+function canDelete() {
+  var v = volById(S.vol);
+  return !!(v && v.kind === "ntfs" && v.writable);
+}
 function updateToolbar() {
+  $("delBtn").style.display = canDelete() ? "" : "none";
   $("mkdirBtn").style.display = canWrite(S.vol) ? "" : "none";
   /* The PS5 browser has no useful file picker: upload is for PCs/phones. */
   $("uploadBtn").style.display = canWrite(S.vol) && !/PlayStation/i.test(navigator.userAgent) ? "" : "none";
@@ -1225,7 +1320,8 @@ var lastJobState = {};
 function renderJobs() {
   var active = 0;
   var h = jobsData.map(function (j) {
-    var pct = j.total_bytes ? Math.min(100, j.done_bytes / j.total_bytes * 100) : (j.state === "done" ? 100 : 0);
+    var pct = j.kind === "delete" ? (j.total_files ? Math.min(100, j.done_files / j.total_files * 100) : (j.state === "done" ? 100 : 0)) :
+      j.total_bytes ? Math.min(100, j.done_bytes / j.total_bytes * 100) : (j.state === "done" ? 100 : 0);
     var speed = j.elapsed_ms > 500 ? j.done_bytes / (j.elapsed_ms / 1000) : 0;
     var eta = speed && j.state === "copying" ? (j.total_bytes - j.done_bytes) / speed : NaN;
     if (j.state === "queued" || j.state === "copying" || j.state === "scanning") active++;
@@ -1234,18 +1330,24 @@ function renderJobs() {
       if (j.dvol && j.dvol !== "ps5") { delete S.volInfo[j.dvol]; refreshVolumes(); }
       if (j.dvol === S.vol) load();
     }
-    if (lastJobState[j.id] && lastJobState[j.id] !== j.state && j.state === "done") toast("Copied " + baseName(j.src) + " to " + j.dest);
-    if (lastJobState[j.id] && lastJobState[j.id] !== j.state && j.state === "failed") toast("Copy failed: " + j.error, true);
+    var isDel = j.kind === "delete", changed = lastJobState[j.id] && lastJobState[j.id] !== j.state;
+    if (changed && j.state === "done") toast(isDel ? "Deleted " + baseName(j.src) : "Copied " + baseName(j.src) + " to " + j.dest);
+    if (changed && j.state === "failed") toast((isDel ? "Delete failed: " : "Copy failed: ") + j.error, true);
     lastJobState[j.id] = j.state;
     var vol = volById(j.vol);
-    var detail = j.state === "copying" ? fmtSize(j.done_bytes) + " of " + fmtSize(j.total_bytes) + " · " + fmtSize(speed) + "/s" + (isFinite(eta) ? " · " + fmtDur(eta) + " left" : "") :
+    var detail = isDel ? (j.state === "copying" ? "Deleting… " + j.done_files + " of " + j.total_files + " file(s)" :
+      j.state === "scanning" ? "Counting files… " + j.total_files + " so far" :
+      j.state === "done" ? "Deleted " + j.done_files + " file(s), " + fmtSize(j.total_bytes) + " freed" :
+      j.state === "failed" ? j.error : j.state === "cancelled" ? "Cancelled after " + j.done_files + " file(s)" : "Waiting…") :
+      j.state === "copying" ? fmtSize(j.done_bytes) + " of " + fmtSize(j.total_bytes) + " · " + fmtSize(speed) + "/s" + (isFinite(eta) ? " · " + fmtDur(eta) + " left" : "") :
       j.state === "scanning" ? "Counting files… " + j.total_files + " so far" :
       j.state === "done" ? j.done_files + " file(s), " + fmtSize(j.total_bytes) + " in " + fmtDur(j.elapsed_ms / 1000) + (j.skipped_files ? " · " + j.skipped_files + " already there" : "") :
       j.state === "failed" ? j.error : j.state === "cancelled" ? "Cancelled" : "Waiting…";
     return '<div class="job ' + j.state + '"><div class="t"><b title="' + esc(j.src) + '">' + esc(baseName(j.src) || volName(vol) || j.src) + '</b>' +
-      '<span class="st-' + j.state + '">' + j.state + '</span>' +
+      '<span class="st-' + j.state + '">' + (isDel ? { queued: "queued", scanning: "counting", copying: "deleting", done: "deleted", failed: "failed", cancelled: "stopped" }[j.state] : j.state) + '</span>' +
       (j.state === "queued" || j.state === "copying" || j.state === "scanning" ? '<button class="ghost" data-cancel="' + j.id + '">Cancel</button>' : "") +
-      '</div><div class="s">→ ' + esc((j.dvol && j.dvol !== "ps5" ? volName(volById(j.dvol)) || j.dvol : "PS5") + ": " + j.dest) + '</div><div class="s">' + esc(detail) + '</div>' +
+      '</div><div class="s">' + (isDel ? "✕ from " + esc((volName(volById(j.vol)) || j.vol) + ": " + parentPath(j.src)) :
+        "→ " + esc((j.dvol && j.dvol !== "ps5" ? volName(volById(j.dvol)) || j.dvol : "PS5") + ": " + j.dest)) + '</div><div class="s">' + esc(detail) + '</div>' +
       (j.state === "copying" ? '<div class="s">' + esc(j.current) + '</div>' : "") +
       '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div></div>';
   });
@@ -1299,6 +1401,7 @@ function action(a) {
     case "back": if (S.path !== "/") go(S.vol, parentPath(S.path)); break;
     case "select": if (e) { toggleSel(e); setCur(S.cur + 1); } break;
     case "copy": var s = selected(); openCopy(s.length ? s : e ? [e] : []); break;
+    case "delete": if (canDelete()) { var sd = selected(); deleteItems(sd.length ? sd : e ? [e] : []); } break;
   }
 }
 document.addEventListener("keydown", function (ev) {
@@ -1314,6 +1417,7 @@ document.addEventListener("keydown", function (ev) {
     Enter: "open", ArrowRight: "open", Backspace: "back", ArrowLeft: "back", " ": "select" };
   var a = map[ev.key];
   if (!a && (ev.key === "c" || ev.key === "C")) a = "copy";
+  if (!a && ev.key === "Delete") a = "delete";
   if (!a && ev.key === "/") { $("filter").focus(); ev.preventDefault(); return; }
   if (a) { action(a); ev.preventDefault(); }
 });

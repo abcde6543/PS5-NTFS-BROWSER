@@ -847,3 +847,11 @@ int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_
   }
   return 0;
 }
+
+int vfs_delete(vol_t *v, const char *path) {
+  if (v->kind != VOL_NTFS) return -ENOTSUP;
+  uint64_t parent;
+  char name[512];
+  int rc = ntfs_parent(v, path, &parent, name, sizeof name);
+  return rc ? rc : ntfs_unlink(v->ntfs, parent, name);
+}

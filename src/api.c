@@ -37,6 +37,7 @@ static int err_status(int rc) {
     case EEXIST:  return 409;
     case EROFS:   return 403;
     case ENOSPC:  return 507;
+    case ENOTSUP: return 409;
     default:      return 500;
   }
 }
@@ -435,6 +436,27 @@ static void route_search(http_req_t *r) {
   buf_free(&b);
 }
 
+static void route_delete(http_req_t *r) {
+  if (require_post(r)) return;
+  char vol[32] = "", raw[1024] = "", path[1024], err[256];
+  http_param(r, "vol", vol, sizeof vol);
+  http_param(r, "path", raw, sizeof raw);
+  if (vfs_clean_path(raw, path, sizeof path)) {
+    http_send_error(r, 400, "bad path");
+    return;
+  }
+  int id = jobs_delete(vol, path, err, sizeof err);
+  if (id < 0) {
+    http_send_error(r, err_status(id), err);
+    return;
+  }
+  buf_t b;
+  buf_init(&b);
+  buf_printf(&b, "{\"job\":%d}", id);
+  http_send_json(r, 200, &b);
+  buf_free(&b);
+}
+
 static void route_eject(http_req_t *r) {
   if (require_post(r)) return;
   char vol[32] = "";
@@ -608,6 +630,7 @@ void api_handle(http_req_t *r) {
       {"/api/writable", route_writable},
       {"/api/search", route_search},
       {"/api/eject", route_eject},
+      {"/api/delete", route_delete},
       {"/api/upload", route_upload},
       {"/api/copy", route_copy},
       {"/api/jobs", route_jobs},

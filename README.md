@@ -49,6 +49,11 @@ http://<ps5-ip>:8085
 
   ![Search results](docs/search.png)
 
+- **Delete** files and folders on NTFS drives (Delete button, the trash icon
+  on a row, or the Delete key). The first delete on a device asks once for
+  confirmation; after that, deleting is immediate. Turn the question back on
+  under Settings (gear icon). Folders are deleted with everything in them, in
+  the background with progress.
 - **Eject** button: finishes all writes so the drive can be unplugged safely.
 - **New folder** on the console or on a writable NTFS drive.
 - **Download** files to a phone or PC through the browser.
@@ -75,7 +80,10 @@ http://<ps5-ip>:8085
 | Symlinks / junctions | shown, not followed |
 | Alternate data streams | ignored (main stream only) |
 | Creating files and folders on NTFS | ✅ on by default for clean drives |
-| Changing, renaming or deleting existing NTFS files | ❌ by design (use a PC) |
+| Deleting files and folders on NTFS | ✅ (incl. 8.3 short names, compressed, sparse, fragmented files) |
+| Deleting hard-linked files, files with Windows link tracking (object IDs) or reparse points | ❌ refused, use a PC |
+| Changing or renaming existing NTFS files | ❌ |
+| Deleting on the console's own storage | ❌ by design |
 
 If Windows wasn't shut down cleanly, the most recent changes may still be in
 the NTFS journal and won't be visible. Use "Safely remove" on Windows before
@@ -89,11 +97,12 @@ never modified. To keep a drive untouched anyway, click its lock button to
 make it read-only (or build with `make WRITABLE=0` so every drive starts
 read-only). Use the **eject** button before unplugging after writing.
 
-The writer only ever **adds**
-files and folders: it never changes, renames or deletes anything that is
-already on the drive, so the worst an interruption (say, the drive being
-unplugged mid-copy) can do is leave a partly copied file and a few unused
-clusters, which Windows' `chkdsk` tidies up. Start the same copy again and it
+Copying and uploading only ever **add** files and folders. Deleting removes
+a file's folder entries first and frees its space afterwards, so the worst an
+interruption (say, the drive being unplugged mid-copy or mid-delete) can do is
+leave a partly copied file, an orphaned file, or a few unused clusters, all of
+which Windows' `chkdsk` tidies up. It never leaves a folder entry pointing at
+freed space. Start the same copy again and it
 continues where it stopped.
 
 Writing is refused when the drive isn't in a clean state, because Windows
@@ -241,6 +250,13 @@ sudo make test     # Linux; needs ntfs-3g, attr (setfattr), python3 and /dev/fus
   accounting, MFT bitmap, index order, links), `ntfsresize --check`, and
   ntfs-3g, which must read back every file by name byte for byte and then
   modify the same folders itself.
+- `tests/delete_tests.py` stresses **deleting**: 4,000 files removed one by
+  one at 512 B, 4 KB and 64 KB clusters (index B-tree merges, borrowing and
+  root shrinking), files with 8.3 aliases, compressed, sparse and fragmented
+  files (attribute lists), refusals, and ten rounds of mixed adds and deletes
+  interleaved with ntfs-3g. Every result is checked for index shape (leaves at
+  one depth, no empty nodes), leaked clusters, `ntfsresize --check`, and
+  ntfs-3g reading back every surviving file.
 - `tests/test_server.py` exercises the HTTP API end to end: listing,
   downloads, byte ranges, keep-alive, 16 parallel streams, copy jobs in both
   directions, resume after cancel, write protection, refusing dirty drives,
@@ -289,6 +305,7 @@ All responses are JSON unless noted. Requests that change something must be
 | POST | `/api/upload` (body = file contents) | `vol`, `path` (folder), `name`, `mtime` (optional, Unix time) |
 | GET | `/api/search` | `vol`, `path`, `q` (up to 500 matches) |
 | POST | `/api/eject` | `vol` |
+| POST | `/api/delete` (background job) | `vol`, `path` (NTFS only) |
 | GET | `/api/jobs` | |
 | POST | `/api/jobs/cancel` | `id` |
 | POST | `/api/jobs/clear` | |
@@ -300,10 +317,11 @@ volume from `/api/volumes`.
 ## Security
 
 While it runs, **anyone on your local network can browse the console's files
-and the NTFS drive, and copy or upload files onto the console and writable
-NTFS drives**. This is the same as FTP payloads. The server never
-deletes anything, and only overwrites partly copied files inside the copy
-destination you choose. State-changing requests need a custom
+and the NTFS drive, copy or upload files onto the console and writable NTFS
+drives, and delete files on writable NTFS drives**. Make a drive read-only
+with its lock button if that matters. This is the same as FTP payloads. The server never
+deletes anything except what you delete on NTFS drives, and only overwrites
+partly copied files inside the copy destination you choose. State-changing requests need a custom
 header, so other websites open in the PS5 browser can't trigger them. HTML and
 SVG files from the drive are served as plain text so they can't run scripts.
 Stop the payload, or reboot, when you're done, and don't expose port 8085 to
@@ -324,6 +342,10 @@ the internet.
   or Fast Startup hibernated it. Browsing and copying *from* the drive work;
   to write to it, plug it into Windows and use *Safely remove* (or run
   `chkdsk`, or shut Windows down fully instead of using Fast Startup).
+- **"Windows tracks this file elsewhere" when deleting.** Hard-linked files
+  and files with link-tracking data or reparse points are left alone because
+  removing them properly means editing Windows-only indexes. Delete them on a
+  PC.
 - **"Too fragmented" when copying to NTFS.** Each new file has to fit its
   list of disk extents in one file record. On a badly fragmented drive, very
   large files can exceed that; defragment the drive on Windows, or copy the
