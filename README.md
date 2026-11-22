@@ -54,6 +54,9 @@ http://<ps5-ip>:8085
   confirmation; after that, deleting is immediate. Turn the question back on
   under Settings (gear icon). Folders are deleted with everything in them, in
   the background with progress.
+
+  ![Deleting from an NTFS drive](docs/delete.png)
+
 - **Eject** button: finishes all writes so the drive can be unplugged safely.
 - **New folder** on the console or on a writable NTFS drive.
 - **Download** files to a phone or PC through the browser.
