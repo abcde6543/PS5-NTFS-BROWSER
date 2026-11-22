@@ -82,7 +82,9 @@ void    ntfs_close(ntfs_file_t *f);
 
 /* ---- Writing -------------------------------------------------------------
  *
- * Writing is off until ntfs_enable_write() succeeds. It refuses volumes that
+ * Writing is off until ntfs_enable_write() succeeds. Enabling only checks the
+ * volume and allows writes; the drive is first modified (journal emptied) by
+ * the first actual write. It refuses volumes that
  * Windows did not unmount cleanly (dirty flag, hibernation/Fast Startup,
  * pending journal), because writing to those can corrupt them.
  *
@@ -98,6 +100,9 @@ int  ntfs_can_write(ntfs_vol_t *v, char *why, size_t len);
 int  ntfs_enable_write(ntfs_vol_t *v, char *err, size_t errlen);
 int  ntfs_is_writable(ntfs_vol_t *v);
 void ntfs_disable_write(ntfs_vol_t *v);
+
+/* Flush everything written so far to the device. */
+int  ntfs_sync(ntfs_vol_t *v);
 
 /* Create a folder named name (UTF-8, no '/') in parent. -EEXIST if a file or
  * folder with that name exists (names compare case-insensitively). */

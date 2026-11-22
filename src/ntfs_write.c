@@ -28,6 +28,8 @@
 
 #define NS_POSIX 0
 
+static int prepare_locked(ntfs_vol_t *v);
+
 struct ntfs_wfile {
   ntfs_vol_t *v;
   uint64_t    inode;
@@ -1357,7 +1359,7 @@ int ntfs_mkdir(ntfs_vol_t *v, uint64_t parent, const char *name, int64_t mtime,
   int nlen, rc = check_name(name, n16, &nlen);
   if (rc) return rc;
   pthread_mutex_lock(&v->lock);
-  if (!v->rw) { pthread_mutex_unlock(&v->lock); return -EROFS; }
+  if (!v->rw || prepare_locked(v)) { pthread_mutex_unlock(&v->lock); return -EROFS; }
   uint8_t *rec = malloc(v->rec_size), key[0x42 + 510];
   uint32_t klen;
   uint64_t ino, ref;
@@ -1397,7 +1399,7 @@ int ntfs_create(ntfs_vol_t *v, uint64_t parent, const char *name, uint64_t size,
   if (!f) return -ENOMEM;
   f->a.cu_idx = -1;
   pthread_mutex_lock(&v->lock);
-  if (!v->rw) { pthread_mutex_unlock(&v->lock); free(f); return -EROFS; }
+  if (!v->rw || prepare_locked(v)) { pthread_mutex_unlock(&v->lock); free(f); return -EROFS; }
 
   uint8_t *rec = malloc(v->rec_size), key[0x42 + 510];
   uint32_t klen = 0;
@@ -1455,7 +1457,7 @@ int ntfs_wopen(ntfs_vol_t *v, uint64_t inode, ntfs_wfile_t **out, uint64_t *done
   ntfs_wfile_t *f = calloc(1, sizeof *f);
   if (!f) return -ENOMEM;
   pthread_mutex_lock(&v->lock);
-  int rc = v->rw ? attr_find(v, inode, AT_DATA, NULL, 0, &f->a) : -EROFS;
+  int rc = v->rw && !prepare_locked(v) ? attr_find(v, inode, AT_DATA, NULL, 0, &f->a) : -EROFS;
   if (!rc && (f->a.flags & (ATTR_COMPRESSED | ATTR_ENCRYPTED | ATTR_SPARSE)))
     rc = -ENOTSUP;
   if (!rc && f->a.resident && f->a.size) rc = -ENOTSUP;
@@ -1546,7 +1548,10 @@ static int hib_cb(void *ctx, uint64_t ref, const uint8_t *fn, uint16_t fnlen) {
 int ntfs_can_write(ntfs_vol_t *v, char *why, size_t len) {
   pthread_mutex_lock(&v->lock);
   int rc = 0;
-  if (v->ver_major != 3) {
+  if (v->write_err[0]) {
+    snprintf(why, len, "%s", v->write_err);
+    rc = -EROFS;
+  } else if (v->ver_major != 3) {
     snprintf(why, len, "only NTFS 3.x volumes can be written");
     rc = -ENOTSUP;
   } else if (v->dirty) {
@@ -1604,16 +1609,18 @@ int ntfs_can_write(ntfs_vol_t *v, char *why, size_t len) {
   return rc;
 }
 
-int ntfs_enable_write(ntfs_vol_t *v, char *err, size_t errlen) {
-  int rc = ntfs_can_write(v, err, errlen);
-  if (rc) return rc;
-  pthread_mutex_lock(&v->lock);
-  if (v->rw) { pthread_mutex_unlock(&v->lock); return 0; }
-  rc = bdev_enable_write(v->dev);
+/* Do the work that touches the drive: reopen it read-write, load the
+ * allocation bitmap and empty the journal. Deferred until the first write so
+ * that drives which are only browsed are never modified. Caller holds the
+ * volume lock. */
+static int prepare_locked(ntfs_vol_t *v) {
+  if (v->rw_ready) return 0;
+  int rc = bdev_enable_write(v->dev);
   if (rc) {
-    snprintf(err, errlen, "the drive can't be opened for writing: %s", strerror(-rc));
-    pthread_mutex_unlock(&v->lock);
-    return rc;
+    snprintf(v->write_err, sizeof v->write_err,
+             "the drive can't be opened for writing (%s)", strerror(-rc));
+    v->rw = 0;
+    return -EROFS;
   }
   rc = attr_find(v, INODE_BITMAP, AT_DATA, NULL, 0, &v->cbmp);
   if (!rc && (v->cbmp.resident || v->cbmp.size * 8 < v->total_clusters)) rc = -EIO;
@@ -1642,21 +1649,38 @@ int ntfs_enable_write(ntfs_vol_t *v, char *err, size_t errlen) {
   }
   if (rc) {
     attr_free(&v->cbmp);
-    snprintf(err, errlen, "could not prepare the drive for writing");
-  } else {
-    v->alloc_hint = v->mft_lcn + v->total_clusters / 8;
-    if (v->alloc_hint >= v->total_clusters) v->alloc_hint = 0;
-    v->mft_hint = FIRST_FREE_RECORD;
-    v->rw = 1;
-    bdev_flush(v->dev);
+    snprintf(v->write_err, sizeof v->write_err,
+             "the drive could not be prepared for writing (write error)");
+    v->rw = 0;
+    return -EROFS;
   }
+  v->alloc_hint = v->mft_lcn + v->total_clusters / 8;
+  if (v->alloc_hint >= v->total_clusters) v->alloc_hint = 0;
+  v->mft_hint = FIRST_FREE_RECORD;
+  v->rw_ready = 1;
+  bdev_flush(v->dev);
+  return 0;
+}
+
+int ntfs_enable_write(ntfs_vol_t *v, char *err, size_t errlen) {
+  int rc = ntfs_can_write(v, err, errlen);
+  if (rc) return rc;
+  pthread_mutex_lock(&v->lock);
+  v->rw = 1;
   pthread_mutex_unlock(&v->lock);
-  return rc;
+  return 0;
+}
+
+int ntfs_sync(ntfs_vol_t *v) {
+  pthread_mutex_lock(&v->lock);
+  int rc = v->rw_ready ? bdev_flush(v->dev) : 0;
+  pthread_mutex_unlock(&v->lock);
+  return rc ? -EIO : 0;
 }
 
 void ntfs_disable_write(ntfs_vol_t *v) {
   pthread_mutex_lock(&v->lock);
-  if (v->rw) bdev_flush(v->dev);
+  if (v->rw_ready) bdev_flush(v->dev);
   v->rw = 0;
   pthread_mutex_unlock(&v->lock);
 }

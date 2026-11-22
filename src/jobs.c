@@ -77,34 +77,7 @@ static int join(char *out, size_t outlen, const char *a, const char *b) {
   return n < 0 || (size_t)n >= outlen ? -1 : 0;
 }
 
-/* Make a name valid for Windows-style file systems (NTFS written by us,
- * exFAT/FAT USB drives): no \\ : * ? " < > |, no control characters, no
- * trailing dot or space, and not a reserved device name such as CON. */
-static void safe_name(char *dst, size_t len, const char *src) {
-  static const char *reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
-                                   "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-                                   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-                                   "LPT7", "LPT8", "LPT9"};
-  char tmp[1024];
-  snprintf(tmp, sizeof tmp, "%s", src);
-  for (char *p = tmp; *p; p++)
-    if (strchr("\\:*?\"<>|", *p) || (unsigned char)*p < 0x20) *p = '_';
-  size_t n = strlen(tmp);
-  while (n && (tmp[n - 1] == '.' || tmp[n - 1] == ' ')) tmp[--n] = '_';
-  if (!n) snprintf(tmp, sizeof tmp, "_");
-  char stem[16];
-  size_t sl = strcspn(tmp, ".");
-  if (sl < sizeof stem) {
-    memcpy(stem, tmp, sl);
-    stem[sl] = 0;
-    for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++)
-      if (!strcasecmp(stem, reserved[i])) {
-        snprintf(dst, len, "_%s", tmp);
-        return;
-      }
-  }
-  snprintf(dst, len, "%s", tmp);
-}
+#define safe_name vfs_safe_name
 
 /* ---- Scan ---------------------------------------------------------------- */
 
@@ -404,6 +377,17 @@ int jobs_copy(const char *vol, const char *src, const char *dvol, const char *de
   pthread_cond_signal(&g_cond);
   pthread_mutex_unlock(&g_lock);
   return j->id;
+}
+
+int jobs_vol_busy(const char *vol) {
+  int busy = 0;
+  pthread_mutex_lock(&g_lock);
+  for (int i = 0; i < MAX_JOBS; i++) {
+    job_t *j = g_jobs[i];
+    if (j && j->state < J_DONE && (!strcmp(j->vol, vol) || !strcmp(j->dvol, vol))) busy = 1;
+  }
+  pthread_mutex_unlock(&g_lock);
+  return busy;
 }
 
 int jobs_cancel(int id) {

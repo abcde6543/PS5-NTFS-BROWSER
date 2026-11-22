@@ -67,6 +67,16 @@ void vfs_add_source(const char *path);
 int vfs_mount_path(const char *path, char *err, size_t errlen);
 int vfs_unmount(const char *id);
 
+/* Whether newly found clean NTFS drives allow writing straight away. */
+void vfs_set_default_writable(int on);
+
+/* Flush an NTFS volume and unmount it so the drive can be unplugged. */
+int vfs_eject(const char *id);
+
+/* Find entries whose name contains query (case-insensitive for ASCII) in
+ * path and everything below it. Entry names are paths relative to path. */
+int vfs_search(vol_t *v, const char *path, const char *query, size_t max, vlist_t *out);
+
 /* JSON array of mounted volumes. */
 void vfs_volumes_json(buf_t *b);
 
@@ -112,6 +122,11 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
 int vfs_wwrite(vwfile_t *w, const void *buf, size_t len);
 /* ok = 0 abandons the file (native: removes the partial copy). */
 int vfs_wclose(vwfile_t *w, int ok);
+
+/* Make a name valid on Windows-style file systems (NTFS, exFAT): replaces
+ * \\ : * ? " < > | and control characters, trailing dots/spaces, and
+ * reserved device names such as CON. */
+void vfs_safe_name(char *dst, size_t len, const char *src);
 
 /* Normalise a client-supplied path: collapse "//", drop "." and reject "..".
  * Output always starts with '/'. Returns 0 on success. */

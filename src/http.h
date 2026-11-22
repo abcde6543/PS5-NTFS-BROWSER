@@ -33,6 +33,10 @@ typedef struct http_req {
   int    sent_headers;
   int    head_only;
   int    trusted;         /* sent the X-NTFSB header: same-origin UI call */
+  uint64_t content_length;
+  uint64_t body_left;     /* request body bytes not yet consumed */
+  const char *body_buf;   /* body bytes that arrived with the headers */
+  size_t body_buf_len;
   char   raw[16384];
 } http_req_t;
 
@@ -46,6 +50,11 @@ void http_run(int listen_fd, http_handler h);
 
 /* Fetch a decoded query parameter into out. Returns 1 if present. */
 int http_param(const http_req_t *r, const char *name, char *out, size_t outlen);
+
+/* Read up to len bytes of the request body. Returns the count, 0 at the end
+ * of the body, or -1 on error. Unread body bytes are discarded after the
+ * handler returns (or the connection is closed if there are many). */
+ssize_t http_body_read(http_req_t *r, void *buf, size_t len);
 
 /* Send a complete response. */
 void http_send(http_req_t *r, int status, const char *ctype, const void *body,

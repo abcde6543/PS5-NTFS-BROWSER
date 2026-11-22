@@ -14,5 +14,8 @@ int jobs_copy(const char *vol, const char *src, const char *dvol, const char *de
               char *err, size_t errlen);
 
 int  jobs_cancel(int id);
+
+/* 1 if a queued or running job reads from or writes to this volume. */
+int  jobs_vol_busy(const char *vol);
 void jobs_clear_finished(void);
 void jobs_json(buf_t *b);

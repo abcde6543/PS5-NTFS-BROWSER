@@ -95,7 +95,9 @@ struct ntfs_vol {
   uint32_t sector;         /* bytes per sector from the boot sector */
 
   /* Write support (see ntfs_write.c). */
-  int      rw;             /* writes enabled */
+  int      rw;             /* writes allowed */
+  int      rw_ready;       /* device reopened read-write, bitmap loaded */
+  char     write_err[160]; /* why preparing for writes failed, if it did */
   attr_t   cbmp;           /* $Bitmap $DATA: cluster allocation bitmap */
   uint64_t alloc_hint;     /* next cluster to try when allocating */
   uint64_t mft_hint;       /* next MFT record to try */

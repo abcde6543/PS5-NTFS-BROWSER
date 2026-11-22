@@ -13,6 +13,7 @@ PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
 
 PORT           ?= 8085
 LAUNCH_BROWSER ?= 1
+WRITABLE       ?= 1
 
 HOST_CC ?= cc
 HOST_WARN := $(shell $(HOST_CC) -Werror -Wno-format-truncation -x c -c -o /dev/null /dev/null 2>/dev/null && echo -Wno-format-truncation)
@@ -22,7 +23,8 @@ SRCS := src/main.c src/api.c src/http.c src/vfs.c src/jobs.c src/platform.c \
 HDRS := $(wildcard src/*.h) build/web_index.h
 
 COMMON_CFLAGS := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -O2 -Ibuild \
-                 -DDEFAULT_PORT=$(PORT) -DLAUNCH_BROWSER=$(LAUNCH_BROWSER)
+                 -DDEFAULT_PORT=$(PORT) -DLAUNCH_BROWSER=$(LAUNCH_BROWSER) \
+                 -DDEFAULT_WRITABLE=$(WRITABLE)
 
 PS5_CC     := $(PS5_PAYLOAD_SDK)/bin/prospero-clang
 PS5_STRIP  := $(PS5_PAYLOAD_SDK)/bin/prospero-strip

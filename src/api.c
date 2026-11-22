@@ -36,6 +36,7 @@ static int err_status(int rc) {
     case EINVAL:  return 400;
     case EEXIST:  return 409;
     case EROFS:   return 403;
+    case ENOSPC:  return 507;
     default:      return 500;
   }
 }
@@ -393,6 +394,143 @@ static void route_copy(http_req_t *r) {
   buf_free(&b);
 }
 
+static void list_json(buf_t *b, vlist_t *l) {
+  for (size_t i = 0; i < l->n; i++) {
+    ventry_t *e = &l->e[i];
+    buf_puts(b, i ? ",{\"n\":" : "{\"n\":");
+    buf_json_str(b, e->name);
+    buf_printf(b, ",\"d\":%d,\"s\":%llu,\"t\":%lld,\"h\":%d,\"l\":%d,\"a\":%u}",
+               e->is_dir, (unsigned long long)e->size, (long long)e->mtime,
+               e->hidden, e->is_link, e->attrs);
+  }
+}
+
+#define SEARCH_MAX 500
+
+static void route_search(http_req_t *r) {
+  char path[1024], q[256] = "";
+  vol_t *v = get_vol_path(r, path, sizeof path);
+  if (!v) return;
+  http_param(r, "q", q, sizeof q);
+  vlist_t l;
+  int rc = vfs_search(v, path, q, SEARCH_MAX, &l);
+  if (rc) {
+    vfs_put(v);
+    http_send_error(r, rc == -EINVAL ? 400 : err_status(rc),
+                    rc == -EINVAL ? "type something to search for" : err_text(rc));
+    return;
+  }
+  buf_t b;
+  buf_init(&b);
+  buf_puts(&b, "{\"vol\":");
+  buf_json_str(&b, v->id);
+  buf_puts(&b, ",\"path\":");
+  buf_json_str(&b, path);
+  buf_printf(&b, ",\"truncated\":%s,\"entries\":[", l.n >= SEARCH_MAX ? "true" : "false");
+  list_json(&b, &l);
+  buf_puts(&b, "]}");
+  vfs_list_free(&l);
+  vfs_put(v);
+  http_send_json(r, 200, &b);
+  buf_free(&b);
+}
+
+static void route_eject(http_req_t *r) {
+  if (require_post(r)) return;
+  char vol[32] = "";
+  http_param(r, "vol", vol, sizeof vol);
+  if (jobs_vol_busy(vol)) {
+    http_send_error(r, 409, "a copy is still using this drive; wait for it or cancel it");
+    return;
+  }
+  int rc = vfs_eject(vol);
+  if (rc) {
+    http_send_error(r, rc == -ENOENT ? 404 : 500,
+                    rc == -ENOENT ? "drive not found" : "could not flush the drive");
+    return;
+  }
+  route_volumes(r);
+}
+
+/* Upload: the request body is the file. ?vol=&path=<folder>&name=&mtime= */
+static void route_upload(http_req_t *r) {
+  if (require_post(r)) return;
+  char dir[1024], raw_name[512] = "", name[512], mt[32] = "", full[1600];
+  vol_t *v = get_vol_path(r, dir, sizeof dir);
+  if (!v) return;
+  http_param(r, "name", raw_name, sizeof raw_name);
+  http_param(r, "mtime", mt, sizeof mt);
+  vfs_safe_name(name, sizeof name, raw_name);
+  int rc = 0;
+  const char *msg = NULL;
+  ventry_t st;
+  if (!raw_name[0] || strchr(raw_name, '/')) { rc = -EINVAL; msg = "bad file name"; }
+  else if (v->kind == VOL_NTFS && !ntfs_is_writable(v->ntfs)) rc = -EROFS;
+  else if (vfs_stat(v, dir, &st) || !st.is_dir) { rc = -ENOENT; msg = "destination folder not found"; }
+  if (!rc) {
+    int64_t fr = vfs_free_bytes(v, dir);
+    if (fr >= 0 && (uint64_t)fr < r->content_length) {
+      vfs_put(v);
+      http_send_error(r, 507, "not enough free space");
+      return;
+    }
+  }
+  snprintf(full, sizeof full, "%s/%s", strcmp(dir, "/") ? dir : "", name);
+  vwfile_t w;
+  uint64_t done = 0;
+  if (!rc) {
+    rc = vfs_wopen(v, full, r->content_length, mt[0] ? atoll(mt) : 0, &w, &done);
+    if (rc == -EEXIST) msg = "a different file with that name already exists";
+  }
+  if (rc) {
+    vfs_put(v);
+    http_send_error(r, err_status(rc), msg ? msg : err_text(rc));
+    return;
+  }
+
+  uint8_t *buf = malloc(STREAM_BUF);
+  uint64_t got = 0, total = r->content_length;
+  if (!buf) rc = -ENOMEM;
+  /* Skip what an earlier, interrupted upload already wrote. */
+  while (!rc && got < done) {
+    size_t want = done - got < STREAM_BUF ? (size_t)(done - got) : STREAM_BUF;
+    ssize_t n = http_body_read(r, buf, want);
+    if (n <= 0) rc = -EPIPE;
+    else got += (uint64_t)n;
+  }
+  while (!rc && got < total) {
+    size_t want = total - got < STREAM_BUF ? (size_t)(total - got) : STREAM_BUF;
+    size_t fill = 0;
+    while (fill < want) {
+      ssize_t n = http_body_read(r, buf + fill, want - fill);
+      if (n <= 0) { rc = -EPIPE; break; }
+      fill += (size_t)n;
+    }
+    if (fill) {
+      int wr = vfs_wwrite(&w, buf, fill);
+      if (wr) rc = wr;
+      else got += fill;
+    }
+  }
+  free(buf);
+  int rc2 = vfs_wclose(&w, rc == 0);
+  if (!rc) rc = rc2;
+  vfs_put(v);
+  if (rc) {
+    http_send_error(r, rc == -EPIPE ? 400 : 500,
+                    rc == -EPIPE ? "upload interrupted" : err_text(rc));
+    return;
+  }
+  buf_t b;
+  buf_init(&b);
+  buf_puts(&b, "{\"name\":");
+  buf_json_str(&b, name);
+  buf_printf(&b, ",\"size\":%llu,\"skipped\":%s}", (unsigned long long)total,
+             done >= total && total ? "true" : "false");
+  http_send_json(r, 200, &b);
+  buf_free(&b);
+}
+
 static void route_jobs(http_req_t *r) {
   buf_t b;
   buf_init(&b);
@@ -437,6 +575,9 @@ void api_handle(http_req_t *r) {
       {"/api/unmount", route_unmount},
       {"/api/mkdir", route_mkdir},
       {"/api/writable", route_writable},
+      {"/api/search", route_search},
+      {"/api/eject", route_eject},
+      {"/api/upload", route_upload},
       {"/api/copy", route_copy},
       {"/api/jobs", route_jobs},
       {"/api/jobs/cancel", route_cancel},

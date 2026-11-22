@@ -33,9 +33,23 @@ http://<ps5-ip>:8085
   where it stopped when you start it again.
   ![Copying from the console onto an NTFS drive](docs/copy-to-usb.png)
 
-- **Write safely**: NTFS drives start **read-only**. Writing is switched on per
-  drive with the lock button, and it is refused on drives Windows didn't
-  unmount cleanly (see [Writing to NTFS](#writing-to-ntfs)).
+- **Read-write by default, safely**: clean NTFS drives are writable as soon as
+  they are plugged in, and the drive is only touched when you actually write
+  to it. Drives Windows didn't unmount cleanly stay read-only (see
+  [Writing to NTFS](#writing-to-ntfs)). The lock button makes any drive
+  read-only.
+- **Upload from a PC or phone**: drag files onto the page, or use **Upload**,
+  to send them straight to the console or the NTFS drive, with progress.
+  Interrupted uploads to NTFS resume when you send the same file again.
+
+  ![Uploading from a PC](docs/upload.png)
+
+- **Search** a folder and all its subfolders by name (type in the filter box
+  and press Enter).
+
+  ![Search results](docs/search.png)
+
+- **Eject** button: finishes all writes so the drive can be unplugged safely.
 - **New folder** on the console or on a writable NTFS drive.
 - **Download** files to a phone or PC through the browser.
 
@@ -60,7 +74,7 @@ http://<ps5-ip>:8085
 | Encrypted files (EFS) | ❌ listed, but contents can't be read |
 | Symlinks / junctions | shown, not followed |
 | Alternate data streams | ignored (main stream only) |
-| Creating files and folders on NTFS | ✅ opt-in per drive |
+| Creating files and folders on NTFS | ✅ on by default for clean drives |
 | Changing, renaming or deleting existing NTFS files | ❌ by design (use a PC) |
 
 If Windows wasn't shut down cleanly, the most recent changes may still be in
@@ -69,8 +83,13 @@ unplugging.
 
 ### Writing to NTFS
 
-Writing is **off until you turn it on** for a drive (the lock button next to
-it, or *Allow writing* in the copy dialog). The writer only ever **adds**
+Clean drives are **writable by default**. Nothing is written to a drive until
+you copy, upload or create something on it, so a drive you only browse is
+never modified. To keep a drive untouched anyway, click its lock button to
+make it read-only (or build with `make WRITABLE=0` so every drive starts
+read-only). Use the **eject** button before unplugging after writing.
+
+The writer only ever **adds**
 files and folders: it never changes, renames or deletes anything that is
 already on the drive, so the worst an interruption (say, the drive being
 unplugged mid-copy) can do is leave a partly copied file and a few unused
@@ -168,6 +187,7 @@ make                                  # -> ntfs-browser.elf
 make PS5_PAYLOAD_SDK=/path/to/sdk     # SDK elsewhere
 make PORT=9090                        # different HTTP port (default 8085)
 make LAUNCH_BROWSER=0                 # don't open the PS5 browser on start
+make WRITABLE=0                       # NTFS drives start read-only
 ```
 
 ### Making a release
@@ -188,6 +208,7 @@ reads NTFS images or devices you pass on the command line:
 ```sh
 make host
 ./build/ntfs-browser -p 8085 my-ntfs.img /dev/sdb   # then open http://localhost:8085
+./build/ntfs-browser -r my-ntfs.img                  # -r: drives start read-only
 ./build/ntfstool ls   my-ntfs.img /some/folder
 ./build/ntfstool cat  my-ntfs.img /some/file.txt
 ./build/ntfstool tree my-ntfs.img
@@ -265,6 +286,9 @@ All responses are JSON unless noted. Requests that change something must be
 | GET/HEAD | `/api/file` (raw bytes, supports `Range`) | `vol`, `path`, `dl=1` to download |
 | POST | `/api/copy` | `vol`, `path`, `dvol` (destination drive, default `ps5`), `dest` |
 | POST | `/api/writable` | `vol`, `on=1` / `on=0` |
+| POST | `/api/upload` (body = file contents) | `vol`, `path` (folder), `name`, `mtime` (optional, Unix time) |
+| GET | `/api/search` | `vol`, `path`, `q` (up to 500 matches) |
+| POST | `/api/eject` | `vol` |
 | GET | `/api/jobs` | |
 | POST | `/api/jobs/cancel` | `id` |
 | POST | `/api/jobs/clear` | |
@@ -276,8 +300,8 @@ volume from `/api/volumes`.
 ## Security
 
 While it runs, **anyone on your local network can browse the console's files
-and the NTFS drive, and start copies onto the console** (and onto NTFS drives
-you have made writable). This is the same as FTP payloads. The server never
+and the NTFS drive, and copy or upload files onto the console and writable
+NTFS drives**. This is the same as FTP payloads. The server never
 deletes anything, and only overwrites partly copied files inside the copy
 destination you choose. State-changing requests need a custom
 header, so other websites open in the PS5 browser can't trigger them. HTML and
@@ -292,6 +316,10 @@ the internet.
   **Open image** with the device path (for example `/dev/da0`); browse `/dev`
   under *Root /* to find it. Some USB hubs and enclosures need a moment after
   plugging in, so the app retries several times.
+- **Drive gone after Eject.** That's intended, so it can be unplugged. Press
+  **Rescan** to use it again without unplugging.
+- **Upload button missing on the console.** The PS5 browser can't pick local
+  files; upload from a PC or phone browser instead.
 - **"Volume is dirty" / writing refused.** Windows didn't unmount it cleanly,
   or Fast Startup hibernated it. Browsing and copying *from* the drive work;
   to write to it, plug it into Windows and use *Safely remove* (or run

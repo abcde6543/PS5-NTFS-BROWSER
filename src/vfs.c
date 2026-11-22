@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/time.h>
@@ -40,6 +41,9 @@ static probed_t g_probed[MAX_PROBED];
 static int      g_nprobed;
 static unsigned g_next_id;
 static unsigned g_gen = 1;
+static int      g_default_rw = 1;   /* allow writing on clean drives at mount */
+
+void vfs_set_default_writable(int on) { g_default_rw = on; }
 
 void vfs_init(void) {
   memset(&g_native, 0, sizeof g_native);
@@ -160,6 +164,12 @@ static int probe_node(const char *node, char *err, size_t errlen) {
 
     vol_t *v = calloc(1, sizeof *v);
     if (!v) { ntfs_umount(nv); continue; }
+    if (g_default_rw) {
+      /* Only allows writes; the drive is first touched by the first write.
+       * Drives that aren't clean (dirty, hibernated...) stay read-only. */
+      char why[256];
+      ntfs_enable_write(nv, why, sizeof why);
+    }
     v->kind = VOL_NTFS;
     v->ntfs = nv;
     v->serial = info.serial;
@@ -621,6 +631,14 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
       if (rc) return rc;
       if (st.is_dir || st.size != size) return -EEXIST;
       rc = ntfs_wopen(v->ntfs, ino, &w->nw, done);
+      if (!rc && *done < size && mtime > 0 && st.mtime != mtime) {
+        /* A partly written file with the same name and size but a different
+         * date is a different file: don't stitch the two together. */
+        ntfs_wclose(w->nw);
+        w->nw = NULL;
+        *done = 0;
+        return -EEXIST;
+      }
       if (rc == -ENOTSUP) {
         /* Same size but not ours to continue (e.g. compressed): treat a
          * same-sized file as already there. */
@@ -683,3 +701,124 @@ int vfs_wclose(vwfile_t *w, int ok) {
   }
   return 0;
 }
+
+/* ---- Eject & search ------------------------------------------------------ */
+
+int vfs_eject(const char *id) {
+  vol_t *v = vfs_get(id);
+  if (!v || v->kind != VOL_NTFS) {
+    vfs_put(v);
+    return -ENOENT;
+  }
+  int rc = ntfs_sync(v->ntfs);
+  vfs_put(v);
+  if (rc) return rc;
+  return vfs_unmount(id);
+}
+
+typedef struct sctx {
+  vol_t *v;
+  const char *q;       /* lower-case query */
+  vlist_t *out;
+  size_t max;
+  int depth;
+  unsigned visited;
+  char rel[2048];
+} sctx_t;
+
+/* ASCII case-insensitive substring match; other bytes must match exactly. */
+static int name_match(const char *name, const char *q) {
+  size_t nl = strlen(name), ql = strlen(q);
+  if (ql > nl) return 0;
+  for (size_t i = 0; i + ql <= nl; i++) {
+    size_t k = 0;
+    while (k < ql) {
+      unsigned char a = (unsigned char)name[i + k], b = (unsigned char)q[k];
+      if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + 32);
+      if (a != b) break;
+      k++;
+    }
+    if (k == ql) return 1;
+  }
+  return 0;
+}
+
+static void search_dir(sctx_t *s, const char *path) {
+  if (s->out->n >= s->max || s->depth > 32 || ++s->visited > 20000) return;
+  vlist_t l;
+  if (vfs_list(s->v, path, &l)) return;
+  size_t base = strlen(s->rel);
+  for (size_t i = 0; i < l.n && s->out->n < s->max; i++) {
+    ventry_t *e = &l.e[i];
+    snprintf(s->rel + base, sizeof s->rel - base, "%s%s", base ? "/" : "", e->name);
+    if (name_match(e->name, s->q)) {
+      ventry_t copy = *e;
+      if (list_push(s->out, s->rel, &copy)) break;
+    }
+    if (e->is_dir && !e->is_link) {
+      char child[2048];
+      snprintf(child, sizeof child, "%s/%s", strcmp(path, "/") ? path : "", e->name);
+      s->depth++;
+      search_dir(s, child);
+      s->depth--;
+    }
+    s->rel[base] = 0;
+  }
+  vfs_list_free(&l);
+}
+
+int vfs_search(vol_t *v, const char *path, const char *query, size_t max, vlist_t *out) {
+  memset(out, 0, sizeof *out);
+  char q[256];
+  size_t n = 0;
+  for (; query[n] && n + 1 < sizeof q; n++) {
+    unsigned char c = (unsigned char)query[n];
+    q[n] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+  }
+  q[n] = 0;
+  if (!n) return -EINVAL;
+  sctx_t s;
+  memset(&s, 0, sizeof s);
+  s.v = v;
+  s.q = q;
+  s.out = out;
+  s.max = max;
+  ventry_t st;
+  int rc = vfs_stat(v, path, &st);
+  if (rc) return rc;
+  if (!st.is_dir) return -ENOTDIR;
+  search_dir(&s, path);
+  return 0;
+}
+
+/* ---- Names --------------------------------------------------------------- */
+
+/* Make a name valid for Windows-style file systems (NTFS written by us,
+ * exFAT/FAT USB drives): no \\ : * ? " < > |, no control characters, no
+ * trailing dot or space, and not a reserved device name such as CON. */
+void vfs_safe_name(char *dst, size_t len, const char *src) {
+  static const char *reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
+                                   "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                                   "LPT7", "LPT8", "LPT9"};
+  char tmp[1024];
+  snprintf(tmp, sizeof tmp, "%s", src);
+  for (char *p = tmp; *p; p++)
+    if (strchr("\\:*?\"<>|", *p) || (unsigned char)*p < 0x20) *p = '_';
+  size_t n = strlen(tmp);
+  while (n && (tmp[n - 1] == '.' || tmp[n - 1] == ' ')) tmp[--n] = '_';
+  if (!n) snprintf(tmp, sizeof tmp, "_");
+  char stem[16];
+  size_t sl = strcspn(tmp, ".");
+  if (sl < sizeof stem) {
+    memcpy(stem, tmp, sl);
+    stem[sl] = 0;
+    for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++)
+      if (!strcasecmp(stem, reserved[i])) {
+        snprintf(dst, len, "_%s", tmp);
+        return;
+      }
+  }
+  snprintf(dst, len, "%s", tmp);
+}
+

@@ -870,7 +870,7 @@ fail:
 
 void ntfs_umount(ntfs_vol_t *v) {
   if (!v) return;
-  if (v->rw) bdev_flush(v->dev);
+  if (v->rw_ready) bdev_flush(v->dev);
   attr_free(&v->cbmp);
   bdev_close(v->dev);
   attr_free(&v->mft);

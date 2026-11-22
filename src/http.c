@@ -225,21 +225,19 @@ static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
     h = e + 2;
   }
 
-  /* We take no request bodies; discard any that arrive (bounded). */
+  /* The body is read on demand by the handler (http_body_read). Bytes of
+   * it that came with the headers wait in raw; anything after the body is
+   * the next pipelined request. */
   size_t extra = len - head_len;
-  if (content_length > 1024 * 1024) return -1;
+  r->content_length = r->body_left = content_length;
+  r->body_buf = r->raw + head_len;
   if (extra > content_length) {
     size_t keep = extra - (size_t)content_length;
+    r->body_buf_len = (size_t)content_length;
     memmove(carry, r->raw + head_len + content_length, keep);
     *carry_len = keep;
   } else {
-    uint64_t left = content_length - extra;
-    char junk[4096];
-    while (left) {
-      ssize_t n = recv(r->fd, junk, left < sizeof junk ? (size_t)left : sizeof junk, 0);
-      if (n <= 0) return -1;
-      left -= (uint64_t)n;
-    }
+    r->body_buf_len = extra;
     *carry_len = 0;
   }
   return 0;
@@ -332,6 +330,39 @@ typedef struct client {
 static pthread_mutex_t g_count_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_clients;
 
+ssize_t http_body_read(http_req_t *r, void *buf, size_t len) {
+  if (!r->body_left || !len) return 0;
+  if (len > r->body_left) len = (size_t)r->body_left;
+  if (r->body_buf_len) {
+    size_t n = len < r->body_buf_len ? len : r->body_buf_len;
+    memcpy(buf, r->body_buf, n);
+    r->body_buf += n;
+    r->body_buf_len -= n;
+    r->body_left -= n;
+    return (ssize_t)n;
+  }
+  for (;;) {
+    ssize_t n = recv(r->fd, buf, len, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      r->keep_alive = 0;
+      return -1;
+    }
+    r->body_left -= (uint64_t)n;
+    return n;
+  }
+}
+
+/* Throw away whatever the handler didn't read of the body. */
+static int drain_body(http_req_t *r) {
+  if (!r->body_left) return 0;
+  if (r->body_left > 1024 * 1024) return -1; /* not worth it: close */
+  char junk[4096];
+  while (r->body_left)
+    if (http_body_read(r, junk, sizeof junk) <= 0) return -1;
+  return 0;
+}
+
 static void *client_main(void *arg) {
   client_t c = *(client_t *)arg;
   free(arg);
@@ -346,7 +377,7 @@ static void *client_main(void *arg) {
       if (read_request(r, carry, &carry_len)) break;
       c.h(r);
       if (!r->sent_headers) http_send_error(r, 500, "no response");
-      if (!r->keep_alive) break;
+      if (!r->keep_alive || drain_body(r)) break;
     }
   }
   free(r);

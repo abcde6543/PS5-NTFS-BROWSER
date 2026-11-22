@@ -81,6 +81,118 @@ def build_image():
         sh("umount", MNT)
 
 
+def sha_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def upload(vol, folder, name, data, mtime=None):
+    params = {"vol": vol, "path": folder, "name": name}
+    if mtime:
+        params["mtime"] = str(mtime)
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+    c.request("POST", "/api/upload?" + urllib.parse.urlencode(params), body=data,
+              headers={"X-NTFSB": "1", "Content-Type": "application/octet-stream"})
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    try:
+        return r.status, json.loads(body)
+    except ValueError:
+        return r.status, {}
+
+
+def upload_cut(vol, folder, name, total, sent, data=None, mtime=None):
+    """Start an upload of `total` bytes but hang up after `sent`."""
+    params = {"vol": vol, "path": folder, "name": name}
+    if mtime:
+        params["mtime"] = str(mtime)
+    q = urllib.parse.urlencode(params)
+    sk = socket.create_connection(("127.0.0.1", PORT))
+    sk.sendall(("POST /api/upload?%s HTTP/1.1\r\nHost: x\r\nX-NTFSB: 1\r\n"
+                "Content-Length: %d\r\n\r\n" % (q, total)).encode())
+    sk.sendall(data[:sent] if data else b"z" * sent)
+    time.sleep(0.3)
+    sk.close()
+    time.sleep(0.5)
+
+
+def v13_tests(expect):
+    """Upload, search and eject (v1.3)."""
+    s, j = jget("/api/volumes")
+    vid = [x for x in j["volumes"] if x["kind"] == "ntfs"][0]["id"]
+    jget("/api/writable", {"vol": vid, "on": "1"}, "POST")
+
+    # Upload onto the NTFS drive.
+    rnd = random.Random(77)
+    files = {"Uploaded ✓.bin": rnd.randbytes(5_000_000), "tiny.txt": b"hi",
+             "empty.dat": b"", "bad:name?.txt": b"sanitise me"}
+    jget("/api/mkdir", {"vol": vid, "path": "/Uploads"}, "POST")
+    ok = True
+    for n, d in files.items():
+        st, j = upload(vid, "/Uploads", n, d, mtime=1700000000)
+        ok = ok and st == 200
+        name = j.get("name", n)
+        s2, h, b = req("GET", "/api/file", {"vol": vid, "path": "/Uploads/" + name})
+        ok = ok and s2 == 200 and b == d
+    check("upload to NTFS (incl. empty + unicode)", ok)
+    s, j = jget("/api/list", {"vol": vid, "path": "/Uploads"})
+    names = {e["n"] for e in j["entries"]}
+    check("upload name sanitised", "bad_name_.txt" in names, str(names))
+    st, j = upload(vid, "/Uploads", "tiny.txt", b"hi")
+    check("re-upload of same file skipped", st == 200 and j.get("skipped") is True, str(j))
+    st, j = upload(vid, "/Uploads", "tiny.txt", b"different!")
+    check("upload over a different file refused", st == 409, str(j))
+    st, j = upload(vid, "/nope", "x.txt", b"x")
+    check("upload into missing folder -> 404", st == 404, str(j))
+
+    # Interrupted upload to NTFS resumes; to the console leaves nothing.
+    big = rnd.randbytes(3_000_000)
+    upload_cut(vid, "/Uploads", "resume.bin", len(big), 1_000_000, big, 1700000001)
+    st, j = upload(vid, "/Uploads", "resume.bin", big, mtime=1700000001)
+    s2, h, b = req("GET", "/api/file", {"vol": vid, "path": "/Uploads/resume.bin"})
+    check("interrupted NTFS upload completes on retry", st == 200 and b == big, str(j))
+    other = rnd.randbytes(3_000_000)
+    upload_cut(vid, "/Uploads", "clash.bin", len(other), 500_000, other, 1700000002)
+    st, j = upload(vid, "/Uploads", "clash.bin", big, mtime=1700000099)
+    check("different file never resumes a partial one", st == 409, str(j))
+    native = os.path.join(WORK, "up-native")
+    os.makedirs(native)
+    upload_cut("ps5", native, "cut.bin", 2_000_000, 500_000)
+    check("interrupted console upload leaves no file", os.listdir(native) == [], str(os.listdir(native)))
+    st, j = upload("ps5", native, "pic.png", big[:123456])
+    check("upload to console storage", st == 200 and open(os.path.join(native, "pic.png"), "rb").read() == big[:123456])
+
+    # Read-only drives refuse uploads.
+    jget("/api/writable", {"vol": vid, "on": "0"}, "POST")
+    st, j = upload(vid, "/Uploads", "ro.txt", b"x")
+    check("upload to read-only drive refused", st == 403, str(j))
+    jget("/api/writable", {"vol": vid, "on": "1"}, "POST")
+
+    # Search.
+    s, j = jget("/api/search", {"vol": vid, "path": "/", "q": "FILE_00"})
+    found = {e["n"] for e in j.get("entries", [])}
+    check("search finds nested files, any case",
+          s == 200 and "Backup/PS5/Saves/file_001.dat" in found and "Backup/PS5/Saves/deep/er/f000.bin" not in found,
+          str(sorted(found)[:5]))
+    s, j = jget("/api/search", {"vol": vid, "path": "/Backup", "q": "f000"})
+    check("search below a folder", s == 200 and [e["n"] for e in j["entries"]] == ["PS5/Saves/deep/er/f000.bin"], str(j))
+    s, j = jget("/api/search", {"vol": vid, "path": "/", "q": ""})
+    check("empty search -> 400", s == 400)
+
+    # Eject flushes and unmounts; the image must be consistent right away.
+    s, j = jget("/api/eject", {"vol": vid}, "POST")
+    check("eject", s == 200 and not [x for x in j["volumes"] if x["kind"] == "ntfs"], str(j))
+    tool = os.path.join(os.path.dirname(BIN), "ntfstool")
+    r = subprocess.run([tool, "check", IMG], capture_output=True, text=True)
+    check("drive consistent straight after eject", r.returncode == 0, r.stdout + r.stderr)
+    # Files the offline verification expects.
+    expect["__uploads__"] = files
+
+
 def file_hash_ntfs(path):
     s, h, b = req("GET", "/api/file", {"vol": "ntfs0", "path": path})
     return hashlib.sha256(b).hexdigest(), b
@@ -100,8 +212,11 @@ def main():
                 break
             except OSError:
                 time.sleep(0.1)
+        h0 = sha_file(IMG)
         run_tests()
+        check("browsing never modifies a writable drive", sha_file(IMG) == h0)
         expect = write_tests()
+        v13_tests(expect)
     finally:
         proc.terminate()
         out = proc.communicate(timeout=5)[0].decode(errors="replace")
@@ -126,6 +241,12 @@ def verify_offline(expect):
     sh("ntfs-3g", "-o", "ro", IMG, MNT)
     try:
         ok = True
+        uploads = (expect or {}).pop("__uploads__", {})
+        for n, d in uploads.items():
+            n = n.replace("bad:name?.txt", "bad_name_.txt")
+            with open(os.path.join(MNT, "Uploads", n), "rb") as f:
+                if f.read() != d:
+                    ok = False
         for rel, data in (expect or {}).items():
             name = rel.replace("video:clip?.mp4", "video_clip_.mp4")
             with open(os.path.join(MNT, "Backup/PS5", name), "rb") as f:
@@ -151,6 +272,10 @@ def verify_offline(expect):
             except OSError:
                 time.sleep(0.1)
         c = http.client.HTTPConnection("127.0.0.1", PORT + 1, timeout=10)
+        c.request("GET", "/api/volumes")
+        v = [x for x in json.loads(c.getresponse().read())["volumes"] if x["kind"] == "ntfs"][0]
+        check("dirty drive starts read-only, with the reason",
+              v["writable"] is False and "cleanly" in v["write_block"], str(v))
         c.request("POST", "/api/writable?vol=ntfs0&on=1", headers={"X-NTFSB": "1"})
         r = c.getresponse()
         body = json.loads(r.read())
@@ -368,6 +493,10 @@ def write_tests():
     expect["Saves/video:clip?.mp4"] = big  # name needs sanitising
     open(os.path.join(srcdir, "Saves/video:clip?.mp4"), "wb").write(big)
 
+    s, j = jget("/api/volumes")
+    v = [x for x in j["volumes"] if x["id"] == vid][0]
+    check("clean drive is writable by default", v.get("writable") is True, str(v))
+    jget("/api/writable", {"vol": vid, "on": "0"}, "POST")
     s, j = jget("/api/copy", {"vol": "ps5", "path": srcdir + "/Saves", "dvol": vid, "dest": "/Backup"}, "POST")
     check("copy to read-only NTFS refused", s == 403, str(j))
     s, j = jget("/api/mkdir", {"vol": vid, "path": "/x"}, "POST")

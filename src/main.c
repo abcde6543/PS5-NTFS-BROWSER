@@ -1,10 +1,10 @@
 /* NTFS Browser for jailbroken PS5 consoles.
  *
- * Runs as an ELF payload. It finds NTFS formatted USB drives, mounts them
- * read-only with a built-in NTFS driver and serves a file browser UI on
+ * Runs as an ELF payload. It finds NTFS formatted USB drives, reads and
+ * writes them with a built-in NTFS driver and serves a file browser UI on
  * http://<console-ip>:8085 that also opens in the PS5's own web browser.
  *
- * Desktop build (for testing): ./ntfs-browser [-p port] [image-or-device ...] */
+ * Desktop build (for testing): ./ntfs-browser [-p port] [-r] [image-or-device ...] */
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -21,6 +21,10 @@
 
 #ifndef DEFAULT_PORT
 #define DEFAULT_PORT 8085
+#endif
+
+#ifndef DEFAULT_WRITABLE
+#define DEFAULT_WRITABLE 1
 #endif
 
 #ifndef LAUNCH_BROWSER
@@ -47,12 +51,16 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   plat_init();
   vfs_init();
+  vfs_set_default_writable(DEFAULT_WRITABLE);
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-p") && i + 1 < argc) {
       port = (uint16_t)atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "-r")) {
+      vfs_set_default_writable(0); /* NTFS drives start read-only */
     } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      printf("usage: %s [-p port] [ntfs-image-or-device ...]\n", argv[0]);
+      printf("usage: %s [-p port] [-r] [ntfs-image-or-device ...]\n"
+             "  -r  NTFS drives start read-only\n", argv[0]);
       return 0;
     } else {
       vfs_add_source(argv[i]);
