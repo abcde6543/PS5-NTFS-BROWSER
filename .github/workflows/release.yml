@@ -28,7 +28,7 @@ jobs:
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       # Tag pushes build the tag; manual runs build the selected branch.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: |
