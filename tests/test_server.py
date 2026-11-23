@@ -120,11 +120,44 @@ def upload_cut(vol, folder, name, total, sent, data=None, mtime=None):
     time.sleep(0.5)
 
 
+def eject_busy_tests(vid):
+    """Eject must refuse while an upload is still writing to the drive:
+    saying 'safe to unplug' with data still in flight loses that data."""
+    total = 6_000_000
+    data = os.urandom(total)
+    q = urllib.parse.urlencode({"vol": vid, "path": "/", "name": "inflight.bin"})
+    sk = socket.create_connection(("127.0.0.1", PORT), 30)
+    sk.sendall(("POST /api/upload?%s HTTP/1.1\r\nHost: 127.0.0.1\r\nX-NTFSB: 1\r\n"
+                "Content-Length: %d\r\n\r\n" % (q, total)).encode())
+    sk.sendall(data[:2_000_000])
+    time.sleep(0.7)  # the handler has opened the file and is waiting for the rest
+    s, j = jget("/api/eject", {"vol": vid}, "POST")
+    check("eject refused while an upload is writing", s == 409, str(j))
+    s, j = jget("/api/volumes")
+    check("drive still mounted after the refused eject",
+          any(x["kind"] == "ntfs" for x in j["volumes"]))
+    sk.sendall(data[2_000_000:])
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        c = sk.recv(4096)
+        if not c:
+            break
+        resp += c
+    sk.close()
+    check("the upload still completes", b" 200 " in resp.split(b"\r\n")[0], str(resp[:80]))
+    s, h, b = req("GET", "/api/file", {"vol": vid, "path": "/inflight.bin"})
+    check("...and its file is intact", s == 200 and b == data)
+    s, j = jget("/api/delete", {"vol": vid, "path": "/inflight.bin"}, "POST")
+    if s == 200:
+        wait_job(j["job"])
+
+
 def v13_tests(expect):
     """Upload, search and eject (v1.3)."""
     s, j = jget("/api/volumes")
     vid = [x for x in j["volumes"] if x["kind"] == "ntfs"][0]["id"]
     jget("/api/writable", {"vol": vid, "on": "1"}, "POST")
+    eject_busy_tests(vid)
 
     # Upload onto the NTFS drive.
     rnd = random.Random(77)

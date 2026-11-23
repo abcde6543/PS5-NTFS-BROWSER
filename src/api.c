@@ -467,8 +467,10 @@ static void route_eject(http_req_t *r) {
   }
   int rc = vfs_eject(vol);
   if (rc) {
-    http_send_error(r, rc == -ENOENT ? 404 : 500,
-                    rc == -ENOENT ? "drive not found" : "could not flush the drive");
+    http_send_error(r, rc == -ENOENT ? 404 : rc == -EBUSY ? 409 : 500,
+                    rc == -ENOENT ? "drive not found"
+                    : rc == -EBUSY ? "an upload or copy is still writing to this drive; wait for it to finish"
+                                   : "could not flush the drive");
     return;
   }
   route_volumes(r);
