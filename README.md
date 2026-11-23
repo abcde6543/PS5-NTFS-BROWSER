@@ -155,8 +155,9 @@ automatically. Files and folders become readable and writable by everyone.
    With etaHEN you can also put the file in its payload folder and launch it
    from the etaHEN menu.
 4. A notification shows the address, and the PS5 browser opens on the file
-   browser. Plug in the NTFS drive; it appears in the sidebar within about
-   3 seconds.
+   browser. Plug in the NTFS drive; it appears in the sidebar after about
+   10–15 seconds (the app leaves a freshly plugged drive alone until the
+   console has finished attaching it).
 
 Sending the payload again while it's already running just reopens the
 browser.
@@ -335,8 +336,9 @@ the internet.
 - **Drive not listed.** Press **Rescan**. Check that the drive is NTFS and
   not BitLocker-encrypted. If your console names USB devices differently, use
   **Open image** with the device path (for example `/dev/da0`); browse `/dev`
-  under *Root /* to find it. Some USB hubs and enclosures need a moment after
-  plugging in, so the app retries several times.
+  under *Root /* to find it. A drive plugged in while the app runs is first
+  left alone for about 10 seconds; some USB hubs and enclosures need even
+  longer, so the app retries several times, waiting a little longer each time.
 - **Drive gone after Eject.** That's intended, so it can be unplugged. Press
   **Rescan** to use it again without unplugging.
 - **Upload button missing on the console.** The PS5 browser can't pick local

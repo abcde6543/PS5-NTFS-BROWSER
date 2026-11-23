@@ -24,10 +24,21 @@
 #define MAX_SOURCES 32
 #define MAX_PROBED  64
 
+/* A device node that appears while we run is left alone for SETTLE_MS: in
+ * its first seconds the console's own USB stack is still attaching the drive
+ * (tasting it, trying to mount exFAT/FAT, sometimes re-enumerating it), and
+ * opening and reading the raw disk in that window is best avoided. Nodes that
+ * already exist when the payload starts are probed straight away. */
+#define SETTLE_MS      10000
+/* After a failed open, wait 3, 6, 12, 24 s before the next attempts. */
+#define RETRY_BASE_MS  3000
+
 typedef struct probed {
-  char path[300];
-  int  rejected;  /* no NTFS found; skip unless forced */
-  int  tries;     /* failed opens; a new drive can take a moment to be ready */
+  char    path[300];
+  int     rejected;    /* no NTFS found; skip unless forced */
+  int     tries;       /* failed opens; a new drive can take a moment to be ready */
+  int64_t first_seen;  /* when the node appeared (monotonic ms) */
+  int64_t next_try;    /* no new attempt before this after a failed open */
 } probed_t;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   /* volume list */
@@ -202,23 +213,43 @@ static int cmp_str(const void *a, const void *b) {
   return strcmp((const char *)a, (const char *)b);
 }
 
-/* Candidate device nodes, sorted so whole disks come before partitions. */
+static int64_t mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* "da" followed by digits only: a whole disk. Partition nodes (da0s1, da0p1)
+ * and other views (da0.crypt) are left out; part_scan() finds the partitions
+ * on the whole disk, and probing both only read the same drive twice (the
+ * partition node was even re-mounted on every scan, since it never counted as
+ * done). */
+static int whole_disk_name(const char *nm) {
+  if (strncmp(nm, "da", 2) || !nm[2]) return 0;
+  for (const char *p = nm + 2; *p; p++)
+    if (*p < '0' || *p > '9') return 0;
+  return 1;
+}
+
+/* Candidate device nodes, sorted. */
 static int candidates(char (*out)[300], int max) {
   int n = 0;
 #ifdef __PROSPERO__
-  /* USB mass storage shows up as da<N> plus partition nodes. */
-  DIR *d = opendir("/dev");
+  /* USB mass storage shows up as da<N>. */
+  const char *dev = "/dev";
+#else
+  /* Host tests can point this at a directory that stands in for /dev. */
+  const char *dev = getenv("NTFSB_TEST_DEV_DIR");
+#endif
+  DIR *d = dev ? opendir(dev) : NULL;
   if (d) {
     struct dirent *e;
     while ((e = readdir(d)) && n < max) {
-      const char *nm = e->d_name;
-      if (strncmp(nm, "da", 2) || nm[2] < '0' || nm[2] > '9') continue;
-      if (strchr(nm, '.')) continue; /* e.g. encrypted ".crypt" views */
-      snprintf(out[n++], 300, "/dev/%s", nm);
+      if (!whole_disk_name(e->d_name)) continue;
+      snprintf(out[n++], 300, "%s/%s", dev, e->d_name);
     }
     closedir(d);
   }
-#endif
   pthread_mutex_lock(&g_lock);
   for (int i = 0; i < g_nsources && n < max; i++)
     snprintf(out[n++], 300, "%s", g_sources[i]);
@@ -229,8 +260,11 @@ static int candidates(char (*out)[300], int max) {
 
 int vfs_rescan(int force) {
   static char cand[MAX_PROBED][300];
+  static int scans;
   pthread_mutex_lock(&g_scan);
   int nc = candidates(cand, MAX_PROBED);
+  int64_t now = mono_ms();
+  int first_scan = scans++ == 0;
 
   /* Drop volumes whose device node is gone. */
   pthread_mutex_lock(&g_lock);
@@ -259,19 +293,26 @@ int vfs_rescan(int force) {
     probed_t *p = NULL;
     for (int i = 0; i < g_nprobed; i++)
       if (!strcmp(g_probed[i].path, cand[k])) p = &g_probed[i];
-    if (p && p->rejected && !force) continue;
-    char err[256];
-    int rc = probe_node(cand[k], err, sizeof err);
-    if (!p && g_nprobed < MAX_PROBED) {
+    if (!p) {
+      if (g_nprobed >= MAX_PROBED) continue;
       p = &g_probed[g_nprobed++];
       memset(p, 0, sizeof *p);
       snprintf(p->path, sizeof p->path, "%s", cand[k]);
+      /* Present at start: probe now. Plugged in later: let it settle. */
+      p->first_seen = first_scan ? now - SETTLE_MS : now;
     }
-    if (p) {
-      if (rc == -2) p->tries++;
-      p->rejected = rc == -1 || (rc == -2 && p->tries >= 5);
-      if (!rc) p->tries = 0;
+    if (p->rejected && !force) continue;
+    if (now - p->first_seen < SETTLE_MS) continue;
+    if (p->tries && now < p->next_try && !force) continue;
+    char err[256];
+    int rc = probe_node(cand[k], err, sizeof err);
+    if (rc == -2) {
+      p->tries++;
+      int shift = p->tries - 1 < 4 ? p->tries - 1 : 4;
+      p->next_try = now + ((int64_t)RETRY_BASE_MS << shift);
     }
+    p->rejected = rc == -1 || (rc == -2 && p->tries >= 5);
+    if (!rc) p->tries = 0;
   }
 
   int count = 0;
