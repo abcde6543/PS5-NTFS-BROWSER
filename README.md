@@ -237,6 +237,9 @@ make host
 sudo make test     # Linux; needs ntfs-3g, attr (setfattr), python3 and /dev/fuse
 ```
 
+GitHub Actions runs the same suite, and builds the PS5 payload with the SDK,
+on every pull request and every push to `main` (`.github/workflows/tests.yml`).
+
 - `tests/run_tests.py` builds NTFS images with `mkntfs`, fills them through
   `ntfs-3g` with the awkward cases (6,000-file folders, files fragmented across
   13 MFT records, compressed and sparse files, Unicode and case-only name

@@ -1,0 +1,76 @@
+# Runs the test suite and builds the PS5 payload on every pull request and on
+# every push to main, so a change is checked before it is merged. Pull
+# requests from first-time contributors only run after a maintainer approves
+# them ("Approve and run workflows"), as GitHub requires for forks.
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The PS5 payload SDK version; keep in step with release.yml.
+  SDK_REF: a7685ce8e97ce1f8a4f38253a41d54241c9124f1
+
+jobs:
+  test:
+    name: make test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install test tools (ntfs-3g, setfattr)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ntfs-3g attr make gcc python3
+
+      - name: Check FUSE
+        run: |
+          sudo modprobe fuse || true
+          ls -l /dev/fuse
+
+      # The tests mount images with ntfs-3g, which needs root.
+      - name: make test
+        run: sudo make test
+
+  ps5-build:
+    name: PS5 build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 wget make
+
+      - name: Cache PS5 payload SDK
+        id: sdk-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/ps5-payload-sdk
+          key: ps5-sdk-${{ env.SDK_REF }}
+
+      - name: Build PS5 payload SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/ps5-payload-dev/sdk.git /tmp/sdk
+          git -C /tmp/sdk checkout "$SDK_REF"
+          make -C /tmp/sdk DESTDIR="$HOME/ps5-payload-sdk" install
+
+      - name: Build the payload
+        run: |
+          make clean
+          make ps5 PS5_PAYLOAD_SDK="$HOME/ps5-payload-sdk"
+          sha256sum ntfs-browser.elf
