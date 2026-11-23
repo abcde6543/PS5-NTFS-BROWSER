@@ -48,10 +48,17 @@ int run_push(attr_t *a, int64_t vcn, int64_t lcn, uint64_t len) {
   return 0;
 }
 
+/* No real volume has more clusters than this (2^40 clusters of 4 KiB are
+ * 4 PiB). Capping run starts and lengths here keeps every
+ * "cluster number * cluster size" below 2^64 and every vcn + len inside
+ * int64_t, whatever a damaged run list claims. */
+#define MAX_CLUSTERS (1LL << 40)
+
 /* Decode a mapping-pairs array (the run list of a non-resident attribute). */
 int decode_runs(attr_t *a, const uint8_t *p, const uint8_t *end,
                        int64_t vcn) {
   int64_t lcn = 0;
+  if (vcn < 0 || vcn > MAX_CLUSTERS) return -EIO;
   while (p < end && *p) {
     int lb = *p & 0x0F, ob = *p >> 4;
     p++;
@@ -66,10 +73,11 @@ int decode_runs(attr_t *a, const uint8_t *p, const uint8_t *end,
       if (ob < 8 && (p[ob - 1] & 0x80)) u |= ~0ULL << (8 * ob); /* sign extend */
       delta = (int64_t)u;
       p += ob;
+      if (delta > MAX_CLUSTERS || delta < -MAX_CLUSTERS) return -EIO;
       lcn += delta;
-      if (lcn < 0) return -EIO;
+      if (lcn < 0 || lcn > MAX_CLUSTERS) return -EIO;
     }
-    if (!len) return -EIO;
+    if (!len || len > (uint64_t)(MAX_CLUSTERS - vcn)) return -EIO;
     int rc = run_push(a, vcn, ob ? lcn : -1, len);
     if (rc) return rc;
     vcn += (int64_t)len;
@@ -171,6 +179,7 @@ static int read_raw(ntfs_vol_t *v, const attr_t *a, uint64_t off, uint8_t *buf,
     uint64_t run_end = r ? (uint64_t)(r->vcn + (int64_t)r->len) * cs
                          : (off / cs + 1) * cs;
     size_t n = run_end - off < len ? (size_t)(run_end - off) : len;
+    if (!n) return -EIO; /* never loop without making progress */
     if (!r || r->lcn < 0) {
       memset(buf, 0, n);
     } else {
@@ -295,13 +304,18 @@ const uint8_t *next_attr(const uint8_t *rec, uint32_t rec_size,
   if (p + 8 > used) return NULL;
   const uint8_t *at = rec + p;
   uint32_t type = le32(at), len = le32(at + 4);
-  if (type == AT_END || len < 24 || p + len > used || (len & 7)) return NULL;
+  /* p + 8 <= used here, so used - p can't underflow. (p + len could wrap
+   * around 2^32 and send the cursor backwards: an endless loop.) */
+  if (type == AT_END || len < 24 || (len & 7) || len > used - p) return NULL;
   *pos = p + len;
   return at;
 }
 
 int attr_name_eq(const uint8_t *at, const uint16_t *name, int nlen) {
   if (at[9] != nlen) return 0;
+  /* The name must lie inside the attribute (its length was checked by
+   * next_attr). */
+  if ((uint32_t)le16(at + 10) + 2u * (uint32_t)nlen > le32(at + 4)) return 0;
   const uint8_t *n = at + le16(at + 10);
   for (int i = 0; i < nlen; i++)
     if (le16(n + i * 2) != name[i]) return 0;
@@ -313,7 +327,7 @@ int absorb(attr_t *a, const uint8_t *at, uint32_t at_len, int first) {
   if (!at[8]) {
     uint32_t vlen = le32(at + 16);
     uint16_t voff = le16(at + 20);
-    if ((uint32_t)voff + vlen > at_len) return -EIO;
+    if (voff > at_len || vlen > at_len - voff) return -EIO;
     a->resident = 1;
     a->data = malloc(vlen ? vlen : 1);
     if (!a->data) return -ENOMEM;
