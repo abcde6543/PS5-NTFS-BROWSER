@@ -388,6 +388,10 @@ static void *worker(void *arg) {
       pthread_mutex_unlock(&g_lock);
       continue;
     }
+    /* Claim the job before dropping the lock. While it still says J_QUEUED,
+     * jobs_cancel() can turn it into J_CANCELLED, and jobs_clear_finished()
+     * or the slot reuse in jobs_add() would then free it under run_job(). */
+    next->state = J_SCANNING;
     pthread_mutex_unlock(&g_lock);
     run_job(next);
   }
