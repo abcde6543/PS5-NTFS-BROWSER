@@ -573,6 +573,17 @@ def write_tests():
     job = wait_job(j["job"])
     check("NTFS -> same NTFS copy", job["state"] == "done", str(job))
 
+    # A folder can't be copied into itself, however the destination is spelled:
+    # the copy would find its own output again and run until the drive is full.
+    for src, dest, what in (("/", "/Selfcopy", "the drive root into one of its folders"),
+                            ("/Backup", "/Backup/inner", "a folder into its own subfolder"),
+                            ("/Backup", "/backup/Inner/deeper", "the same, other letter case"),
+                            ("/Backup/PS5", "/BACKUP/ps5", "a folder onto itself")):
+        s, j = jget("/api/copy", {"vol": vid, "path": src, "dvol": vid, "dest": dest}, "POST")
+        check("copy refused: " + what, s == 400 and "itself" in str(j), str(j))
+    s, jj = jget("/api/jobs")
+    check("refused copies start no job", not [x for x in jj["jobs"] if x["state"] not in ("done", "failed", "cancelled")], str(jj))
+
     # Interrupted copy resumes from where it stopped.
     s, j = jget("/api/copy", {"vol": vid, "path": "/big.bin", "dvol": vid, "dest": "/Resume"}, "POST")
     jid = j["job"]

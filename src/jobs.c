@@ -403,6 +403,30 @@ void jobs_init(void) {
   pthread_attr_destroy(&at);
 }
 
+/* Is dest the folder src itself, or somewhere below it? Copying a folder into
+ * itself never ends: the destination is created before the source is listed,
+ * so every level finds the copy it just made. NTFS ignores case in names, so
+ * compare the folders (inode numbers), not their spelling. */
+static int dest_inside_src(vol_t *v, const char *src, const char *dest) {
+  if (!strcmp(src, "/")) return 1; /* the drive root holds every destination */
+  if (v->kind == VOL_NTFS) {
+    uint64_t sino, dino;
+    if (ntfs_lookup(v->ntfs, src, &sino)) return 0; /* the copy fails on its own */
+    char prefix[1024];
+    size_t n = strlen(dest);
+    if (n >= sizeof prefix) return 0;
+    for (size_t i = 0; i <= n; i++) {
+      if (dest[i] != '/' && dest[i]) continue;
+      memcpy(prefix, dest, i);
+      prefix[i] = 0;
+      if (ntfs_lookup(v->ntfs, i ? prefix : "/", &dino) == 0 && dino == sino) return 1;
+    }
+    return 0;
+  }
+  size_t n = strlen(src);
+  return !strncmp(dest, src, n) && (dest[n] == '/' || !dest[n]);
+}
+
 int jobs_copy(const char *vol, const char *src, const char *dvol, const char *dest_dir,
               char *err, size_t errlen) {
   vol_t *dv = vfs_get(dvol);
@@ -413,6 +437,7 @@ int jobs_copy(const char *vol, const char *src, const char *dvol, const char *de
   ventry_t st;
   int src_ok = vfs_stat(dv, dest_dir, &st) == 0 && st.is_dir;
   int ro = dv->kind == VOL_NTFS && !ntfs_is_writable(dv->ntfs);
+  int inside = !strcmp(vol, dvol) && dest_inside_src(dv, src, dest_dir);
   vfs_put(dv);
   if (ro) {
     snprintf(err, errlen, "turn on writing for this drive first");
@@ -422,13 +447,9 @@ int jobs_copy(const char *vol, const char *src, const char *dvol, const char *de
     snprintf(err, errlen, "destination folder does not exist: %s", dest_dir);
     return -ENOENT;
   }
-  if (!strcmp(vol, dvol)) {
-    /* Same drive: refuse copying a folder into itself. */
-    size_t n = strlen(src);
-    if (!strncmp(dest_dir, src, n) && (dest_dir[n] == '/' || !dest_dir[n])) {
-      snprintf(err, errlen, "cannot copy a folder into itself");
-      return -EINVAL;
-    }
+  if (inside) {
+    snprintf(err, errlen, "cannot copy a folder into itself");
+    return -EINVAL;
   }
   job_t *j = calloc(1, sizeof *j);
   if (!j) { snprintf(err, errlen, "out of memory"); return -ENOMEM; }
