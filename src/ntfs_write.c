@@ -2117,26 +2117,49 @@ static int inode_records(ntfs_vol_t *v, uint64_t ino, const uint8_t *base,
   return rc;
 }
 
-/* Free every cluster and record of an inode whose names are all gone. */
+/* Free every cluster and record of an inode whose names are all gone.
+ *
+ * The order matters if the drive is pulled half way: release the MFT records
+ * first and free their clusters afterwards. The worst case is then clusters
+ * that stay marked in use (chkdsk gives them back). The other way round, a
+ * record that is still in use would own clusters the bitmap calls free, and
+ * the next file written would share them. */
 static int free_inode(ntfs_vol_t *v, const uint64_t *recs, int n) {
   uint8_t *rec = malloc(v->rec_size);
   if (!rec) return -ENOMEM;
-  for (int i = 0; i < n; i++) {
+  /* Collect the run lists first: a released record can't be read any more. */
+  attr_t *held = NULL;
+  size_t nheld = 0, cap = 0;
+  int rc = 0;
+  for (int i = 0; i < n && !rc; i++) {
     if (read_record_any(v, recs[i], rec)) continue;
     uint32_t pos = 0;
     const uint8_t *at;
-    while ((at = next_attr(rec, v->rec_size, &pos))) {
+    while (!rc && (at = next_attr(rec, v->rec_size, &pos))) {
       if (!at[8]) continue;
       attr_t a = {0};
       a.cu_idx = -1;
-      if (decode_runs(&a, at + le16(at + 32), at + le32(at + 4), (int64_t)le64(at + 16)) == 0)
-        free_clusters(v, &a);
-      free(a.runs);
+      if (decode_runs(&a, at + le16(at + 32), at + le32(at + 4), (int64_t)le64(at + 16)) != 0) {
+        free(a.runs);
+        continue;
+      }
+      if (nheld == cap) {
+        attr_t *nh = realloc(held, (cap ? cap * 2 : 8) * sizeof *held);
+        if (!nh) { free(a.runs); rc = -ENOMEM; break; }
+        held = nh;
+        cap = cap ? cap * 2 : 8;
+      }
+      held[nheld++] = a;
     }
   }
-  for (int i = 0; i < n; i++) release_record(v, recs[i]);
+  if (!rc) {
+    for (int i = 0; i < n; i++) release_record(v, recs[i]);
+    for (size_t i = 0; i < nheld; i++) free_clusters(v, &held[i]);
+  }
+  for (size_t i = 0; i < nheld; i++) free(held[i].runs);
+  free(held);
   free(rec);
-  return 0;
+  return rc;
 }
 
 typedef struct del_find {
