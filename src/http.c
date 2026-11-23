@@ -279,6 +279,8 @@ static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
         r->trusted = 1;
       } else if (!strcasecmp(h, "Content-Length")) {
         content_length = strtoull(v, NULL, 10);
+      } else if (!strcasecmp(h, "Transfer-Encoding")) {
+        r->chunked = 1;
       } else if (!strcasecmp(h, "Host")) {
         /* Too long to be a valid address: keep it unusable, not truncated. */
         if (snprintf(host, sizeof host, "%s", v) >= (int)sizeof host) host[0] = '!';
@@ -321,6 +323,7 @@ const char *http_status_text(int s) {
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
     case 416: return "Range Not Satisfiable";
+    case 501: return "Not Implemented";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";
     case 507: return "Insufficient Storage";
@@ -444,6 +447,14 @@ static void *client_main(void *arg) {
         r->keep_alive = 0;
         http_send_error(r, 403, "open this page by the console's IP address "
                                 "(http://<console-ip>:8085), not by a name");
+        break;
+      }
+      if (r->chunked) {
+        /* Only Content-Length bodies are understood. Without this, a chunked
+         * upload is stored as an empty file and its body is then parsed as
+         * the next request on the connection. */
+        r->keep_alive = 0;
+        http_send_error(r, 501, "chunked request bodies aren't supported; send a Content-Length");
         break;
       }
       c.h(r);

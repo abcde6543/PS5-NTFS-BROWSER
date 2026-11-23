@@ -283,6 +283,20 @@ def host_tests():
     check("refused POST changes nothing", " 403 " in line and "rebound" not in {e["n"] for e in j["entries"]}, line)
 
 
+def chunked_tests():
+    """A chunked body can't be framed here. It used to be taken for an empty
+    body: the upload reported success with a 0-byte file, and the chunks were
+    then parsed as the next request on the connection."""
+    s, j = jget("/api/volumes")
+    vid = [x for x in j["volumes"] if x["kind"] == "ntfs"][0]["id"]
+    body = "5\r\nhello\r\n0\r\n\r\n"
+    line = raw_status("POST /api/upload?vol=%s&path=/&name=chunked.txt HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      "X-NTFSB: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n%s" % (vid, body))
+    s, j = jget("/api/list", {"vol": vid, "path": "/"})
+    check("chunked upload refused, nothing created",
+          " 501 " in line and "chunked.txt" not in {e["n"] for e in j["entries"]}, line)
+
+
 def main():
     print("work dir:", WORK)
     build_image()
@@ -300,6 +314,7 @@ def main():
         h0 = sha_file(IMG)
         run_tests()
         host_tests()
+        chunked_tests()
         check("browsing never modifies a writable drive", sha_file(IMG) == h0)
         expect = write_tests()
         v13_tests(expect)
