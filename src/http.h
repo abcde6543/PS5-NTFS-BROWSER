@@ -33,6 +33,8 @@ typedef struct http_req {
   int    sent_headers;
   int    head_only;
   int    trusted;         /* sent the X-NTFSB header: same-origin UI call */
+  int    forbidden;       /* Host or Origin doesn't name this server by IP */
+  int    chunked;         /* sent Transfer-Encoding: bodies we can't frame */
   uint64_t content_length;
   uint64_t body_left;     /* request body bytes not yet consumed */
   const char *body_buf;   /* body bytes that arrived with the headers */

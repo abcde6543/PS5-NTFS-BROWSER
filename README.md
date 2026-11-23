@@ -325,7 +325,10 @@ drives, and delete files on writable NTFS drives**. Make a drive read-only
 with its lock button if that matters. This is the same as FTP payloads. The server never
 deletes anything except what you delete on NTFS drives, and only overwrites
 partly copied files inside the copy destination you choose. State-changing requests need a custom
-header, so other websites open in the PS5 browser can't trigger them. HTML and
+header, so other websites open in the PS5 browser can't trigger them. The server
+also only answers requests addressed to its IP address (or `localhost`), so a
+website can't reach it by pointing its own name at the console ("DNS
+rebinding"): open `http://<console-ip>:8085`, not a host name. HTML and
 SVG files from the drive are served as plain text so they can't run scripts.
 Stop the payload, or reboot, when you're done, and don't expose port 8085 to
 the internet.
