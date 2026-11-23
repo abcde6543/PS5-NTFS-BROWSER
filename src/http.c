@@ -1,6 +1,7 @@
 #include "http.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -165,6 +166,63 @@ static void parse_range(http_req_t *r, const char *v) {
   r->has_range = 1;
 }
 
+/* Is host (the Host header, "name[:port]") the console's IP address or
+ * localhost? The X-NTFSB header keeps other websites from posting to this
+ * server, but a website can still make its own host name resolve to the
+ * console's address ("DNS rebinding"): the browser then treats the console as
+ * that site's own origin and lets its scripts send any header and read any
+ * answer. Such a request carries the site's name in Host, so only accept
+ * addresses. A missing Host (HTTP/1.0) is fine. */
+static int host_ok(const char *host) {
+  if (!*host) return 1;
+  const char *p = host;
+  if (*p == '[') { /* IPv6 literal */
+    const char *e = strchr(p, ']');
+    if (!e || e == p + 1) return 0;
+    for (p++; p < e; p++)
+      if (!isxdigit((unsigned char)*p) && *p != ':' && *p != '.') return 0;
+    p = e + 1;
+  } else {
+    size_t n = strcspn(p, ":");
+    if (n == 9 && !strncasecmp(p, "localhost", 9)) {
+      p += n;
+    } else { /* dotted quad */
+      int dots = 0, digits = 0;
+      for (size_t i = 0; i < n; i++) {
+        if (p[i] == '.') {
+          if (!digits) return 0;
+          dots++;
+          digits = 0;
+        } else if (isdigit((unsigned char)p[i])) {
+          digits++;
+        } else {
+          return 0;
+        }
+      }
+      if (dots != 3 || !digits) return 0;
+      p += n;
+    }
+  }
+  if (*p == ':') { /* optional port */
+    if (!*++p) return 0;
+    for (; *p; p++)
+      if (!isdigit((unsigned char)*p)) return 0;
+    return 1;
+  }
+  return !*p;
+}
+
+/* A browser tells which page a request comes from in Origin. Only the UI
+ * served by this very server (same host and port) may call it. */
+static int origin_ok(const char *origin, const char *host) {
+  if (!*origin) return 1;
+  const char *o = origin;
+  if (!strncasecmp(o, "http://", 7)) o += 7;
+  else if (!strncasecmp(o, "https://", 8)) o += 8;
+  else return 0; /* "null" and anything else */
+  return *host && !strcasecmp(o, host);
+}
+
 /* Read one request head. Returns 0 on success, -1 to close. */
 static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
   size_t len = *carry_len;
@@ -201,6 +259,7 @@ static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
 
   /* Headers */
   uint64_t content_length = 0;
+  char host[256] = "", origin[256] = "";
   char *h = line_end + 2;
   while (h < hend) {
     char *e = strstr(h, "\r\n");
@@ -220,10 +279,16 @@ static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
         r->trusted = 1;
       } else if (!strcasecmp(h, "Content-Length")) {
         content_length = strtoull(v, NULL, 10);
+      } else if (!strcasecmp(h, "Host")) {
+        /* Too long to be a valid address: keep it unusable, not truncated. */
+        if (snprintf(host, sizeof host, "%s", v) >= (int)sizeof host) host[0] = '!';
+      } else if (!strcasecmp(h, "Origin")) {
+        if (snprintf(origin, sizeof origin, "%s", v) >= (int)sizeof origin) origin[0] = '!';
       }
     }
     h = e + 2;
   }
+  r->forbidden = !host_ok(host) || !origin_ok(origin, host);
 
   /* The body is read on demand by the handler (http_body_read). Bytes of
    * it that came with the headers wait in raw; anything after the body is
@@ -375,6 +440,12 @@ static void *client_main(void *arg) {
       memset(r, 0, offsetof(http_req_t, raw));
       r->fd = c.fd;
       if (read_request(r, carry, &carry_len)) break;
+      if (r->forbidden) {
+        r->keep_alive = 0;
+        http_send_error(r, 403, "open this page by the console's IP address "
+                                "(http://<console-ip>:8085), not by a name");
+        break;
+      }
       c.h(r);
       if (!r->sent_headers) http_send_error(r, 500, "no response");
       if (!r->keep_alive) break;

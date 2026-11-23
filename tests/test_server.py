@@ -112,7 +112,7 @@ def upload_cut(vol, folder, name, total, sent, data=None, mtime=None):
         params["mtime"] = str(mtime)
     q = urllib.parse.urlencode(params)
     sk = socket.create_connection(("127.0.0.1", PORT))
-    sk.sendall(("POST /api/upload?%s HTTP/1.1\r\nHost: x\r\nX-NTFSB: 1\r\n"
+    sk.sendall(("POST /api/upload?%s HTTP/1.1\r\nHost: 127.0.0.1\r\nX-NTFSB: 1\r\n"
                 "Content-Length: %d\r\n\r\n" % (q, total)).encode())
     sk.sendall(data[:sent] if data else b"z" * sent)
     time.sleep(0.3)
@@ -235,6 +235,54 @@ def file_hash_ntfs(path):
     return hashlib.sha256(b).hexdigest(), b
 
 
+def raw_status(head):
+    """Send a raw request head, return the status line of the answer."""
+    sk = socket.create_connection(("127.0.0.1", PORT), 5)
+    sk.sendall(head.encode())
+    out = b""
+    try:
+        while b"\r\n" not in out:
+            c = sk.recv(4096)
+            if not c:
+                break
+            out += c
+    except OSError:
+        pass
+    sk.close()
+    return out.split(b"\r\n", 1)[0].decode()
+
+
+def host_tests():
+    """DNS rebinding: a page on another site can make its own host name point
+    at the console, which makes the console 'same-origin' for that page. Such
+    requests name the site in Host (and Origin), so only IP addresses and
+    localhost are served."""
+    get = "GET /api/volumes HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+    for host in ("127.0.0.1:%d" % PORT, "localhost:%d" % PORT, "LocalHost", "[::1]:%d" % PORT,
+                 "192.168.1.20:8085"):
+        line = raw_status(get % host)
+        check("Host %s served" % host, " 200 " in line, line)
+    for host in ("evil.example:%d" % PORT, "attacker.test", "127.0.0.1.evil.example", "1.2.3",
+                 "1.2.3.4.5", "999.1.1.1x", "[]", "[evil]", "127.0.0.1:80x", "127.0.0.1:", "a" * 300):
+        line = raw_status(get % host)
+        check("Host %s refused" % host[:30], " 403 " in line, line)
+    me = "127.0.0.1:%d" % PORT
+    for origin, ok in (("http://" + me, True), ("http://evil.example", False),
+                       ("http://evil.example:%d" % PORT, False), ("null", False),
+                       ("http://127.0.0.1:9", False)):
+        line = raw_status("GET /api/volumes HTTP/1.1\r\nHost: %s\r\nOrigin: %s\r\nConnection: close\r\n\r\n"
+                          % (me, origin))
+        check("Origin %s %s" % (origin, "served" if ok else "refused"), (" 200 " in line) == ok, line)
+    # Nothing is changed by a refused POST.
+    s, j = jget("/api/volumes")
+    vid = [x for x in j["volumes"] if x["kind"] == "ntfs"][0]["id"]
+    line = raw_status("POST /api/mkdir?vol=%s&path=/rebound HTTP/1.1\r\nHost: evil.example:%d\r\n"
+                      "Origin: http://evil.example:%d\r\nX-NTFSB: 1\r\nContent-Length: 0\r\n"
+                      "Connection: close\r\n\r\n" % (vid, PORT, PORT))
+    s, j = jget("/api/list", {"vol": vid, "path": "/"})
+    check("refused POST changes nothing", " 403 " in line and "rebound" not in {e["n"] for e in j["entries"]}, line)
+
+
 def main():
     print("work dir:", WORK)
     build_image()
@@ -251,6 +299,7 @@ def main():
                 time.sleep(0.1)
         h0 = sha_file(IMG)
         run_tests()
+        host_tests()
         check("browsing never modifies a writable drive", sha_file(IMG) == h0)
         expect = write_tests()
         v13_tests(expect)
