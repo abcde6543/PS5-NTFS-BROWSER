@@ -37,7 +37,7 @@ jobs:
 
       - name: Cache PS5 payload SDK
         id: sdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ps5-payload-sdk
           key: ps5-sdk-${{ env.SDK_REF }}
