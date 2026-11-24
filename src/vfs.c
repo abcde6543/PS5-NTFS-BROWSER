@@ -654,6 +654,9 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
   if (stat(path, &ds) == 0) {
     if (S_ISDIR(ds.st_mode)) return -EEXIST;
     if ((uint64_t)ds.st_size == size) { *done = size; return 0; }
+    /* A different file has that name: never replace it (as on NTFS, and as
+     * the README promises). Only our own .part file is written over. */
+    return -EEXIST;
   }
   snprintf(w->final, sizeof w->final, "%s", path);
   snprintf(w->tmp, sizeof w->tmp, "%s.part", path);
@@ -843,7 +846,8 @@ int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_
   struct stat ds;
   if (stat(path, &ds) == 0) {
     if (S_ISDIR(ds.st_mode)) return -EEXIST;
-    if ((uint64_t)ds.st_size == size) *done = size;
+    if ((uint64_t)ds.st_size != size) return -EEXIST; /* see vfs_wopen() */
+    *done = size;
   }
   return 0;
 }
