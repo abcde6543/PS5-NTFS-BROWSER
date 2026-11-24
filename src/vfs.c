@@ -560,12 +560,16 @@ int vfs_set_writable(vol_t *v, int on, char *err, size_t errlen) {
   return rc;
 }
 
+/* Room for one file name: NTFS allows 255 UTF-16 units, up to 765 bytes. */
+#define NAME_BUF 1024
+
 /* Split "/a/b/c" into the parent's inode and "c". */
 static int ntfs_parent(vol_t *v, const char *path, uint64_t *parent, char *name,
                        size_t nlen) {
   const char *slash = strrchr(path, '/');
   if (!slash || !slash[1]) return -EINVAL;
-  snprintf(name, nlen, "%s", slash + 1);
+  /* never go on with a shortened name: it would name a different file */
+  if ((size_t)snprintf(name, nlen, "%s", slash + 1) >= nlen) return -ENAMETOOLONG;
   char dir[1024];
   size_t dl = (size_t)(slash - path);
   if (dl >= sizeof dir) return -ENAMETOOLONG;
@@ -577,7 +581,7 @@ static int ntfs_parent(vol_t *v, const char *path, uint64_t *parent, char *name,
 int vfs_mkdir(vol_t *v, const char *path) {
   if (v->kind == VOL_NTFS) {
     uint64_t parent;
-    char name[512];
+    char name[NAME_BUF];
     int rc = ntfs_parent(v, path, &parent, name, sizeof name);
     if (!rc) rc = ntfs_mkdir(v->ntfs, parent, name, (int64_t)time(NULL), NULL);
     return rc;
@@ -622,7 +626,7 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
   *done = 0;
   if (v->kind == VOL_NTFS) {
     uint64_t parent, ino;
-    char name[512];
+    char name[NAME_BUF];
     int rc = ntfs_parent(v, path, &parent, name, sizeof name);
     if (rc) return rc;
     if (ntfs_lookup(v->ntfs, path, &ino) == 0) {
@@ -655,8 +659,9 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
     if (S_ISDIR(ds.st_mode)) return -EEXIST;
     if ((uint64_t)ds.st_size == size) { *done = size; return 0; }
   }
-  snprintf(w->final, sizeof w->final, "%s", path);
-  snprintf(w->tmp, sizeof w->tmp, "%s.part", path);
+  if ((size_t)snprintf(w->final, sizeof w->final, "%s", path) >= sizeof w->final ||
+      (size_t)snprintf(w->tmp, sizeof w->tmp, "%s.part", path) >= sizeof w->tmp)
+    return -ENAMETOOLONG;
   w->fd = open(w->tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   return w->fd < 0 ? -errno : 0;
 }
@@ -851,7 +856,7 @@ int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_
 int vfs_delete(vol_t *v, const char *path) {
   if (v->kind != VOL_NTFS) return -ENOTSUP;
   uint64_t parent;
-  char name[512];
+  char name[NAME_BUF];
   int rc = ntfs_parent(v, path, &parent, name, sizeof name);
   return rc ? rc : ntfs_unlink(v->ntfs, parent, name);
 }
