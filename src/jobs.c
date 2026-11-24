@@ -22,6 +22,15 @@
 #define MAX_JOBS  64
 #define COPY_BUF  (2 * 1024 * 1024)
 
+/* The worker's stack. scan(), copy_tree() and delete_tree() recurse once per
+ * folder level (up to 64) and keep their path buffers on the stack: about
+ * 5.3 KB per level for a copy, plus about 26 KB for the NTFS write path below
+ * the deepest level. The system default is not enough: the console's
+ * libkernel gives a thread without an explicit size only 64 KiB, unless the
+ * process is of a kind that gets 2 MiB. */
+#define WORKER_STACK (1024 * 1024)
+#define MAX_LEVELS   64 /* folder levels below the one a job starts from */
+
 typedef enum { J_QUEUED, J_SCANNING, J_COPYING, J_DONE, J_FAILED, J_CANCELLED } jstate_t;
 
 static const char *state_names[] = {"queued", "scanning", "copying", "done",
@@ -97,7 +106,7 @@ static void count_file(job_t *j, vol_t *dv, const char *dst, uint64_t size) {
 
 static int scan(job_t *j, vol_t *v, vol_t *dv, const char *path, const char *dst, int depth) {
   if (j->cancel) return -ECANCELED;
-  if (depth > 64) return -ELOOP;
+  if (depth > MAX_LEVELS) { fail(j, "more than 64 folder levels: %s", path, 0); return -ELOOP; }
   ventry_t st;
   int rc = vfs_stat(v, path, &st);
   if (rc) { fail(j, "cannot read %s", path, -rc); return rc; }
@@ -186,7 +195,7 @@ static int copy_file(job_t *j, vol_t *v, vol_t *dv, const char *src,
 static int copy_tree(job_t *j, vol_t *v, vol_t *dv, const char *src, const char *dst,
                      uint8_t *buf, int depth) {
   if (j->cancel) return -ECANCELED;
-  if (depth > 64) return -ELOOP;
+  if (depth > MAX_LEVELS) { fail(j, "more than 64 folder levels: %s", src, 0); return -ELOOP; }
   ventry_t st;
   int rc = vfs_stat(v, src, &st);
   if (rc) { fail(j, "cannot read %s", src, -rc); return rc; }
@@ -237,10 +246,16 @@ static const char *delete_error(int rc) {
 
 static int delete_tree(job_t *j, vol_t *v, const char *path, int depth) {
   if (j->cancel) return -ECANCELED;
-  if (depth > 64) return -ELOOP;
   ventry_t st;
   int rc = vfs_stat(v, path, &st);
   if (rc) { fail(j, "cannot read %s", path, -rc); return rc; }
+  /* The same limit as copying: folders up to 64 levels down, with their
+   * files (it used to count the files as a level too, so a tree a copy had
+   * just made could not be deleted, and the job failed without a reason). */
+  if (st.is_dir && depth > MAX_LEVELS) {
+    fail(j, "more than 64 folder levels: %s", path, 0);
+    return -ELOOP;
+  }
   pthread_mutex_lock(&g_lock);
   snprintf(j->current, sizeof j->current, "%s", path);
   pthread_mutex_unlock(&g_lock);
@@ -399,6 +414,7 @@ void jobs_init(void) {
   pthread_attr_t at;
   pthread_attr_init(&at);
   pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&at, WORKER_STACK);
   pthread_create(&t, &at, worker, NULL);
   pthread_attr_destroy(&at);
 }

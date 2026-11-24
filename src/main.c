@@ -91,9 +91,15 @@ int main(int argc, char **argv) {
   plat_notify("NTFS Browser %s\nhttp://%s:%u\n%d NTFS volume(s) found", APP_VERSION,
               ip, port, n);
 
+  /* It mounts drives, like the HTTP threads: give it their stack size instead
+   * of the system default (64 KiB on the console for most processes). */
   pthread_t t;
-  pthread_create(&t, NULL, hotplug_thread, NULL);
-  pthread_detach(t);
+  pthread_attr_t at;
+  pthread_attr_init(&at);
+  pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&at, 256 * 1024);
+  pthread_create(&t, &at, hotplug_thread, NULL);
+  pthread_attr_destroy(&at);
 
 #if LAUNCH_BROWSER && defined(__PROSPERO__)
   {
