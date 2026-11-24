@@ -380,6 +380,12 @@ int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
   uint8_t *ext = malloc(v->rec_size);
   if (!ext) { free(lbuf); rc = -ENOMEM; goto done; }
   int found = 0;
+  /* The segments of a non-resident attribute follow each other: each starts
+   * where the previous one ended (the list is sorted by lowest VCN, as
+   * Windows and ntfs-3g write it). Without this, a list repeating the same
+   * entry hundreds of thousands of times appended the same runs again and
+   * again: gigabytes of memory from a few megabytes on the drive. */
+  uint64_t next_vcn = 0;
   rc = 0;
   for (size_t p = 0; p + 26 <= (size_t)ln && !rc;) {
     const uint8_t *e = lbuf + p;
@@ -387,6 +393,7 @@ int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
     if (elen < 26 || p + elen > (size_t)ln) break;
     p += elen;
     if (le32(e) != type || e[6] != nlen) continue;
+    if (e[7] + 2u * nlen > elen) { rc = -EIO; break; } /* name outside the entry */
     int match = 1;
     for (int i = 0; i < nlen && match; i++)
       if (le16(e + e[7] + i * 2) != name[i]) match = 0;
@@ -405,6 +412,11 @@ int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
       if (le32(seg) == type && le16(seg + 14) == inst &&
           attr_name_eq(seg, name, nlen)) {
         if (seg[8] && le64(seg + 16) != lowest) continue;
+        if (seg[8]) {
+          uint64_t highest = le64(seg + 24);
+          if (lowest != next_vcn || highest < lowest) { rc = -EIO; break; }
+          next_vcn = highest + 1;
+        }
         rc = absorb(out, seg, le32(seg + 4), !found);
         found = 1;
         break;
@@ -432,7 +444,40 @@ typedef struct idx_ctx {
   uint32_t    vcn_unit;
   uint8_t    *blocks[MAX_DEPTH];
   unsigned    visited, max_visits;
+  uint64_t   *seen;             /* VCNs of the blocks walked so far + 1 (hash set) */
+  size_t      seen_cap, seen_n;
 } idx_ctx_t;
+
+/* In a valid B-tree every block has one parent, so it is reached once. A
+ * damaged index whose entries point at the same blocks again and again
+ * (a chain of a few blocks, each pointing at the next from every entry)
+ * would otherwise be walked exponentially often: max_visits comes from the
+ * index size the drive claims. 0 if vcn was new, -EIO if seen before. */
+static int seen_add(idx_ctx_t *ix, uint64_t vcn) {
+  if (ix->seen_n * 2 >= ix->seen_cap) {
+    size_t nc = ix->seen_cap ? ix->seen_cap * 2 : 64;
+    uint64_t *ns = calloc(nc, sizeof *ns);
+    if (!ns) return -ENOMEM;
+    for (size_t i = 0; i < ix->seen_cap; i++) {
+      if (!ix->seen[i]) continue;
+      size_t h = (size_t)(ix->seen[i] * 0x9E3779B97F4A7C15ull) & (nc - 1);
+      while (ns[h]) h = (h + 1) & (nc - 1);
+      ns[h] = ix->seen[i];
+    }
+    free(ix->seen);
+    ix->seen = ns;
+    ix->seen_cap = nc;
+  }
+  uint64_t key = vcn + 1; /* 0 marks a free slot */
+  size_t h = (size_t)(key * 0x9E3779B97F4A7C15ull) & (ix->seen_cap - 1);
+  while (ix->seen[h]) {
+    if (ix->seen[h] == key) return -EIO;
+    h = (h + 1) & (ix->seen_cap - 1);
+  }
+  ix->seen[h] = key;
+  ix->seen_n++;
+  return 0;
+}
 
 /* Callback: return 1 to stop the walk, 0 to continue, <0 on error. */
 
@@ -443,6 +488,8 @@ static int walk_block(idx_ctx_t *ix, uint64_t vcn, int depth, idx_cb cb,
                       void *ctx) {
   if (!ix->have_alloc || depth >= MAX_DEPTH || ++ix->visited > ix->max_visits)
     return -EIO;
+  int src = seen_add(ix, vcn);
+  if (src) return src;
   if (!ix->blocks[depth] && !(ix->blocks[depth] = malloc(ix->block_size)))
     return -ENOMEM;
   uint8_t *b = ix->blocks[depth];
@@ -501,6 +548,7 @@ int index_walk(ntfs_vol_t *v, uint64_t inode, idx_cb cb, void *ctx) {
   }
 
   for (int i = 0; i < MAX_DEPTH; i++) free(ix.blocks[i]);
+  free(ix.seen);
   if (ix.have_alloc) attr_free(&ix.alloc);
   attr_free(&root);
   return rc < 0 ? rc : 0;
@@ -768,6 +816,11 @@ int ntfs_mount(bdev_t *b, ntfs_vol_t **out, char *err, size_t errlen) {
     FAIL("bad MFT record size");
 
   uint64_t total_sectors = le64(bs + 0x28);
+  /* The volume can't be larger than the device it is on. A boot sector
+   * claiming 2^40 sectors made the free-space count walk a terabyte-sized
+   * bitmap; clusters past the device's end can't be read or used anyway. */
+  uint64_t dev_sectors = bdev_size(b) / bps;
+  if (dev_sectors && total_sectors > dev_sectors) total_sectors = dev_sectors;
   v->total_clusters = total_sectors / spc;
   v->serial = le64(bs + 0x48);
   uint64_t mft_lcn = le64(bs + 0x30);
@@ -908,6 +961,7 @@ int ntfs_free_bytes(ntfs_vol_t *v, uint64_t *out) {
   enum { CHUNK = 1024 * 1024 };
   uint8_t *buf = malloc(CHUNK);
   uint64_t bits = v->total_clusters, used = 0;
+  if (bits / 8 > bm.size) bits = bm.size * 8; /* never past $Bitmap's own end */
   uint64_t bytes = (bits + 7) / 8;
   if (!buf) rc = -ENOMEM;
   for (uint64_t off = 0; !rc && off < bytes; off += CHUNK) {
