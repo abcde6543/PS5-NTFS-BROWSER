@@ -852,6 +852,18 @@ static int root_fits(ictx_t *c, const xnode_t *x) {
   return used - cur + want <= cap - cap / 4;
 }
 
+/* Write the directory records changed in memory: the one with
+ * $INDEX_ALLOCATION and $BITMAP first, then the one with the root. */
+static int write_records(ictx_t *c) {
+  int rc = 0;
+  if (c->arec == c->rec && c->arec_dirty) c->rec_dirty = 1;
+  if (c->arec != c->rec && c->arec_dirty) rc = write_record(c->v, c->arec_ino, c->arec);
+  if (!rc) c->arec_dirty = 0;
+  if (!rc && c->rec_dirty) rc = write_record(c->v, c->rec_ino, c->rec);
+  if (!rc) c->rec_dirty = 0;
+  return rc;
+}
+
 /* The index bitmap usually lives in the record; big folders can have it
  * outside (non-resident). These helpers hide the difference. */
 static void idx_bitmap_load(ictx_t *c) {
@@ -1500,18 +1512,21 @@ static int index_insert(ntfs_vol_t *v, uint64_t dir, const uint8_t *key,
   rc = reserve_blocks(&c, (uint64_t)depth + 2);
   if (rc) goto out;
 
-  /* Insert into the leaf, then fix overflows bottom-up. */
+  /* Insert into the leaf, then fix overflows bottom-up, in memory. Only
+   * new blocks (left halves of splits, a root moved down) are written
+   * here: nothing refers to them yet. */
   rc = node_insert(&path[depth], pos[depth], ne.p, ne.len);
   if (rc) goto out;
   ne.p = NULL;
 
+  int top = depth + 1; /* path[top..depth] are changed blocks */
   for (int d = depth; d >= 0; d--) {
     xnode_t *x = &path[d];
     if (d > 0) {
-      if (block_fits(&c, x)) { rc = write_block(&c, x); break; }
+      top = d;
+      if (block_fits(&c, x)) break;
       ient_t upe;
       rc = split_block(&c, x, &upe);
-      if (!rc) rc = write_block(&c, x);
       if (!rc) rc = node_insert(&path[d - 1], pos[d - 1], upe.p, upe.len);
       if (rc) break;
       continue;
@@ -1553,9 +1568,14 @@ static int index_insert(ntfs_vol_t *v, uint64_t dir, const uint8_t *key,
     break;
   }
 
-  if (c.arec == c.rec && c.arec_dirty) c.rec_dirty = 1;
-  if (!rc && c.arec != c.rec && c.arec_dirty) rc = write_record(v, c.arec_ino, c.arec);
-  if (!rc && c.rec_dirty) rc = write_record(v, c.rec_ino, c.rec);
+  /* Then the records (allocation, index bitmap, root), which make the new
+   * blocks part of the index, and only then the changed blocks, top-down.
+   * A split block only gives up entries to its parent and to a new block
+   * the parent points to, both on disk by the time it is written, so an
+   * interruption at any write leaves every existing name reachable (at
+   * worst listed twice). */
+  if (!rc) rc = write_records(&c);
+  for (int d = top; !rc && d <= depth; d++) rc = write_block(&c, &path[d]);
 
 out:
   if (c.arec && c.arec != c.rec) free(c.arec);
@@ -1637,14 +1657,6 @@ static void ictx_close(ictx_t *c) {
   memset(c, 0, sizeof *c);
 }
 
-static int ictx_write_records(ictx_t *c) {
-  int rc = 0;
-  if (c->arec == c->rec && c->arec_dirty) c->rec_dirty = 1;
-  if (c->arec != c->rec && c->arec_dirty) rc = write_record(c->v, c->arec_ino, c->arec);
-  if (!rc && c->rec_dirty) rc = write_record(c->v, c->rec_ino, c->rec);
-  return rc;
-}
-
 /* Full $I30 collation: case-insensitive, then exact as a tie-break. */
 static int collate_full(const ntfs_vol_t *v, const uint16_t *a, int al, const uint8_t *b, int bl) {
   int r = collate(v, a, al, b, bl);
@@ -1717,14 +1729,197 @@ static int node_validate(const ntfs_vol_t *v, const xnode_t *x, int below_root) 
   return 0;
 }
 
+/* ---- Writing a removal -----------------------------------------------------
+ *
+ * A removal can change several nodes: the leaf an entry is taken from, the
+ * node it replaces the removed entry in, a neighbour that lends an entry or
+ * takes in a merged node, the parent whose separators move, the root. They
+ * reach the disk one write at a time, so the order matters: a node that
+ * receives an entry or a sub-node pointer has to be written before the node
+ * that gives it up, or an interruption in between leaves it reachable from
+ * nowhere. Rather than per case, the order is worked out from the old and
+ * new contents: "receiver before giver" for everything that moves. A freed
+ * block gives up its contents when its parent stops pointing to it; a new
+ * block (already written) receives them when the node pointing to it is
+ * written. An interruption can then only leave a duplicate entry or an
+ * unused block behind, which chkdsk tidies up. */
+
+typedef struct wnode {
+  int64_t        vcn;    /* -1 for the root */
+  xnode_t        old;    /* as on disk before the change */
+  const xnode_t *now;    /* what to write; NULL when freed */
+  xnode_t        fresh;  /* a new block's content (now points here) */
+  int            is_new, done;
+} wnode_t;
+
+static int node_has_key(const xnode_t *x, const ient_t *e) {
+  uint16_t kl = le16(e->p + 10);
+  for (int i = 0; x && i < x->n; i++) {
+    const ient_t *f = &x->e[i];
+    if (!ie_is_end(f) && le16(f->p + 10) == kl && !memcmp(f->p, e->p, 8) &&
+        !memcmp(f->p + 16, e->p + 16, kl))
+      return 1;
+  }
+  return 0;
+}
+
+static int node_has_sub(const xnode_t *x, int64_t vcn) {
+  for (int i = 0; x && i < x->n; i++)
+    if (ie_has_sub(&x->e[i]) && ie_sub(&x->e[i]) == vcn) return 1;
+  return 0;
+}
+
+static int node_same(const xnode_t *a, const xnode_t *b) {
+  if (a->n != b->n || !a->internal != !b->internal) return 0;
+  for (int i = 0; i < a->n; i++)
+    if (a->e[i].len != b->e[i].len || memcmp(a->e[i].p, b->e[i].p, a->e[i].len)) return 0;
+  return 1;
+}
+
+/* The node whose old (or new) content points to block vcn. */
+static int wn_parent(const wnode_t *w, int n, int64_t vcn, int old) {
+  for (int i = 0; i < n; i++)
+    if (node_has_sub(old ? &w[i].old : w[i].now, vcn)) return i;
+  return -1;
+}
+
+/* The written node at which w[i]'s old content stops being reachable. */
+static int wn_giver(const wnode_t *w, int n, int i) {
+  for (int guard = 0; i >= 0 && !w[i].now && guard < n; guard++)
+    i = wn_parent(w, n, w[i].vcn, 1);
+  return i >= 0 && w[i].now ? i : -1;
+}
+
+/* The written node at which w[i]'s new content becomes reachable. */
+static int wn_receiver(const wnode_t *w, int n, int i) {
+  for (int guard = 0; i >= 0 && w[i].is_new && guard < n; guard++)
+    i = wn_parent(w, n, w[i].vcn, 0);
+  return i >= 0 && !w[i].is_new ? i : -1;
+}
+
+/* Write the changed root (path[0]), blocks (path[1..depth], sib[]) and
+ * release the freed blocks, in an order that never loses an entry. */
+static int index_commit(ictx_t *c, xnode_t *path, int depth, xnode_t *sib, int nsib,
+                        const int64_t *freed, int nfreed) {
+  ntfs_vol_t *v = c->v;
+  int cap = depth + nsib + nfreed + MAX_DEPTH + 8, n = 0, rc = 0;
+  wnode_t *w = calloc((size_t)cap, sizeof *w);
+  uint8_t *before = calloc((size_t)cap * (size_t)cap, 1);
+  uint8_t *rec = malloc(v->rec_size);
+  if (!w || !before || !rec) { rc = -ENOMEM; goto done; }
+
+  /* Old contents: the root from the record on disk, blocks from disk. */
+  rc = read_record_any(v, c->rec_ino, rec);
+  const uint8_t *ra = rc ? NULL : rec_attr(rec, v->rec_size, AT_INDEX_ROOT, I30, 4);
+  if (!rc && (!ra || ra[8])) rc = -EIO;
+  if (!rc) {
+    const uint8_t *h = ra + le16(ra + 20) + 0x10;
+    rc = node_parse(&w[0].old, h + le32(h), h + le32(h + 4));
+    w[0].old.internal |= h[12] & 1;
+    w[0].vcn = -1;
+    w[0].now = &path[0];
+    n = 1;
+  }
+  for (int k = 0; !rc && k < depth + nsib + nfreed; k++) {
+    const xnode_t *x = k < depth ? &path[k + 1] : k < depth + nsib ? &sib[k - depth] : NULL;
+    int64_t vcn = x ? x->vcn : freed[k - depth - nsib];
+    int dup = vcn < 0;
+    for (int t = 0; t < n; t++) dup |= w[t].vcn == vcn;
+    if (dup) continue;
+    w[n].vcn = vcn;
+    w[n].now = x;
+    w[n].done = !x;
+    rc = load_block(c, vcn, &w[n++].old);
+  }
+  /* New blocks (written already): pointed to by new contents, not by old. */
+  for (int i = 0; !rc && i < n; i++) {
+    for (int j = 0; w[i].now && j < w[i].now->n && !rc; j++) {
+      if (!ie_has_sub(&w[i].now->e[j])) continue;
+      int64_t vcn = ie_sub(&w[i].now->e[j]);
+      int known = 0;
+      for (int t = 0; t < n && !known; t++) known = w[t].vcn == vcn || node_has_sub(&w[t].old, vcn);
+      if (known) continue;
+      if (n >= cap) { rc = -EIO; break; }
+      w[n].vcn = vcn;
+      w[n].is_new = w[n].done = 1;
+      rc = load_block(c, vcn, &w[n].fresh);
+      w[n].now = &w[n].fresh;
+      n++;
+    }
+  }
+  /* Receiver before giver, for every entry and sub-node pointer that moves
+   * (the removed entry and pointers to freed blocks go nowhere). */
+  for (int a = 0; !rc && a < n; a++) {
+    for (int j = 0; j < w[a].old.n; j++) {
+      const ient_t *e = &w[a].old.e[j];
+      for (int kind = 0; kind < 2; kind++) {
+        int b = -1;
+        if (kind == 0) {
+          if (ie_is_end(e) || node_has_key(w[a].now, e)) continue;
+          for (int t = 0; t < n && b < 0; t++) if (node_has_key(w[t].now, e)) b = t;
+        } else {
+          if (!ie_has_sub(e) || node_has_sub(w[a].now, ie_sub(e))) continue;
+          for (int t = 0; t < n && b < 0; t++) if (node_has_sub(w[t].now, ie_sub(e))) b = t;
+        }
+        int r = b < 0 ? -1 : wn_receiver(w, n, b), g = wn_giver(w, n, a);
+        if (r >= 0 && g >= 0 && r != g) before[r * cap + g] = 1;
+      }
+    }
+  }
+
+  /* A grown allocation or a new block's bit in the index bitmap has to be
+   * on disk before anything points there; the root stays as it is on disk
+   * until its turn. */
+  if (!rc && (c->arec_dirty || c->rec_dirty)) {
+    if (c->rec_dirty || c->arec == c->rec) rc = store_root(c, &w[0].old);
+    if (!rc) rc = write_records(c);
+  }
+  while (!rc) {
+    int pick = -1;
+    for (int i = 0; i < n && pick < 0; i++) {
+      int ready = !w[i].done;
+      for (int j = 0; j < n && ready; j++) ready = w[j].done || !before[j * cap + i];
+      if (ready) pick = i;
+    }
+    /* Two nodes that each needed the other first would be a cycle; the
+     * steps above have not been seen to make one, but never stall. */
+    for (int i = 0; i < n && pick < 0; i++)
+      if (!w[i].done) pick = i;
+    if (pick < 0) break;
+    w[pick].done = 1;
+    if (node_same(&w[pick].old, w[pick].now)) continue;
+    if (w[pick].vcn < 0) {
+      rc = store_root(c, w[pick].now);
+      if (!rc) rc = write_records(c);
+    } else {
+      rc = write_block(c, w[pick].now);
+    }
+  }
+  /* Last, release the freed blocks: nothing on disk points to them now. */
+  for (int i = 0; !rc && i < nfreed; i++)
+    if (freed[i] >= 0) rc = idx_set_bit(c, (uint64_t)freed[i] * c->vcn_unit / c->ibs, 0);
+  if (!rc) rc = write_records(c);
+
+done:
+  for (int i = 0; w && i < cap; i++) {
+    node_free(&w[i].old);
+    node_free(&w[i].fresh);
+  }
+  free(w);
+  free(before);
+  free(rec);
+  return rc;
+}
+
 static int index_remove(ntfs_vol_t *v, uint64_t dir, const uint16_t *name, int nlen,
                         uint64_t ino) {
   ictx_t c;
-  xnode_t path[MAX_DEPTH];
-  int pos[MAX_DEPTH], depth = 0;
+  xnode_t path[MAX_DEPTH], sib[MAX_DEPTH]; /* sib: neighbours that lent an entry */
+  int pos[MAX_DEPTH], depth = 0, nsib = 0;
   int64_t freed[MAX_FREED];
   int nfreed = 0;
   memset(path, 0, sizeof path);
+  memset(sib, 0, sizeof sib);
   int rc = ictx_open(v, dir, &c, &path[0]);
   if (rc) goto out;
 
@@ -1831,9 +2026,10 @@ static int index_remove(ntfs_vol_t *v, uint64_t dir, const uint16_t *name, int n
     }
   }
 
-  /* Room for splits the merges below may need. Best effort: nothing is
-   * written until every step has succeeded in memory, so running out of
-   * index blocks later fails cleanly. */
+  /* Room for splits the merges below may need. Best effort: nothing the
+   * index refers to is written until every step has succeeded in memory
+   * (only new blocks are), so running out of index blocks later fails
+   * cleanly. */
   reserve_blocks(&c, (uint64_t)depth + 2);
 
   /* 3. No empty nodes below the root. For an emptied node X, in order of
@@ -1972,7 +2168,8 @@ static int index_remove(ntfs_vol_t *v, uint64_t dir, const uint16_t *name, int n
       if (!rc) rc = ie_set_sub(&up, x->vcn);
       if (!rc) rc = node_insert(p, j, up.p, up.len);
       else free(up.p);
-      if (!rc) rc = write_block(&c, &r);
+      if (!rc && nsib < MAX_DEPTH) { sib[nsib++] = r; memset(&r, 0, sizeof r); }
+      else if (!rc) rc = -EIO;
       node_free(&r);
       node_free(&l);
     } else {
@@ -1990,7 +2187,8 @@ static int index_remove(ntfs_vol_t *v, uint64_t dir, const uint16_t *name, int n
       if (!rc) rc = ie_set_sub(&up, l.vcn);
       if (!rc) rc = node_insert(p, j - 1, up.p, up.len);
       else free(up.p);
-      if (!rc) rc = write_block(&c, &l);
+      if (!rc && nsib < MAX_DEPTH) { sib[nsib++] = l; memset(&l, 0, sizeof l); }
+      else if (!rc) rc = -EIO;
       node_free(&l);
       node_free(&r);
     }
@@ -2057,19 +2255,15 @@ static int index_remove(ntfs_vol_t *v, uint64_t dir, const uint16_t *name, int n
   /* 5c. Everything is decided. Check what is about to be written; any
    * inconsistency means a bug here, so refuse rather than write it. */
   for (int k = 0; k <= depth && !rc; k++) rc = node_validate(v, &path[k], k > 0);
-  if (rc) goto out;
-  for (int k = 1; k <= depth && !rc; k++) rc = write_block(&c, &path[k]);
-  if (!rc) rc = store_root(&c, root);
+  for (int k = 0; k < nsib && !rc; k++) rc = node_validate(v, &sib[k], 1);
   if (rc) goto out;
 
-  /* 6. Release the freed blocks in the index bitmap. */
-  for (int i = 0; i < nfreed && !rc; i++)
-    if (freed[i] >= 0) rc = idx_set_bit(&c, (uint64_t)freed[i] * c.vcn_unit / c.ibs, 0);
-  if (rc) goto out;
-  rc = ictx_write_records(&c);
+  /* 6. Write it, receivers before givers, then release the freed blocks. */
+  rc = index_commit(&c, path, depth, sib, nsib, freed, nfreed);
 
 out:
   for (int d = 0; d < MAX_DEPTH; d++) node_free(&path[d]);
+  for (int d = 0; d < MAX_DEPTH; d++) node_free(&sib[d]);
   ictx_close(&c);
   return rc;
 }
