@@ -499,6 +499,8 @@ static int extend_mft(ntfs_vol_t *v) {
   if (!bat[8]) {
     uint32_t vlen = le32(bat + 16);
     if (need_bytes > vlen) {
+      /* A resident value can't outgrow the record; don't allocate for it. */
+      if (need_bytes > v->rec_size) { rc = -ENOSPC; goto undo; }
       uint8_t *val = calloc(1, (size_t)need_bytes);
       if (!val) { rc = -ENOMEM; goto undo; }
       memcpy(val, bat + le16(bat + 20), vlen);
@@ -717,6 +719,13 @@ static int node_parse(xnode_t *x, const uint8_t *p, const uint8_t *end) {
     p += len;
   }
   return -EIO; /* no terminating entry */
+}
+
+/* $INDEX_ALLOCATION's sizes come from the drive; the index can't be larger
+ * than the volume (a bit flipped there made growing it ask for 4 GB). */
+static int alloc_fits(const ntfs_vol_t *v, const attr_t *a) {
+  uint64_t vol = v->total_clusters * (uint64_t)v->cluster;
+  return a->alloc <= vol && a->size <= a->alloc && a->init <= a->size;
 }
 
 /* $INDEX_ROOT's value: a 16-byte root header, then the node header, whose
@@ -1143,7 +1152,8 @@ static int grow_index_alloc_ext(ictx_t *c) {
   if (!rc && !bat) rc = -EIO;
   if (!rc && !bat[8]) {
     uint32_t vlen = le32(bat + 16);
-    if (need > vlen) {
+    if (need > vlen && need > v->rec_size) rc = -ENOSPC; /* can't stay resident */
+    else if (need > vlen) {
       uint8_t *val = calloc(1, (size_t)need);
       if (!val) rc = -ENOMEM;
       else {
@@ -1244,6 +1254,7 @@ static int grow_index_alloc(ictx_t *c) {
     uint64_t blocks = grown.size / c->ibs;
     uint32_t need = (uint32_t)((blocks + 63) / 64 * 8);
     if (!bat || bat[8]) rc = -ENOTSUP;
+    else if (le32(bat + 16) < need && need > v->rec_size) rc = -ENOSPC; /* can't stay resident */
     else if (le32(bat + 16) < need) {
       uint8_t *val = calloc(1, need);
       if (!val) rc = -ENOMEM;
@@ -1476,6 +1487,7 @@ static int index_insert(ntfs_vol_t *v, uint64_t dir, const uint8_t *key,
   if (c.ibs < 512 || c.ibs > 65536) { rc = -EIO; goto out; }
   c.vcn_unit = v->cluster <= c.ibs ? v->cluster : 512;
   if (attr_find(v, dir, AT_INDEX_ALLOCATION, I30, 4, &c.alloc) == 0) c.has_alloc = 1;
+  if (c.has_alloc && !alloc_fits(v, &c.alloc)) { rc = -EIO; goto out; }
   idx_bitmap_load(&c);
 
   /* New entry. */
@@ -1640,6 +1652,7 @@ static int ictx_open(ntfs_vol_t *v, uint64_t dir, ictx_t *c, xnode_t *root) {
   if (c->ibs < 512 || c->ibs > 65536) return -EIO;
   c->vcn_unit = v->cluster <= c->ibs ? v->cluster : 512;
   if (attr_find(v, dir, AT_INDEX_ALLOCATION, I30, 4, &c->alloc) == 0) c->has_alloc = 1;
+  if (c->has_alloc && !alloc_fits(v, &c->alloc)) return -EIO;
   idx_bitmap_load(c);
   const uint8_t *h = rv + 0x10;
   uint32_t eo = le32(h), il = le32(h + 4);
@@ -2240,6 +2253,8 @@ int ntfs_unlink(ntfs_vol_t *v, uint64_t parent, const char *name) {
       if (t == 0x40 || t == 0xC0) { rc = -ENOTSUP; break; }
       if (t != AT_FILE_NAME || at[8]) continue;
       const uint8_t *fn = at + le16(at + 20);
+      uint32_t fnlen = le32(at + 16); /* inside the attribute: read_record() */
+      if (fnlen < 0x42 || 0x42 + 2u * fn[0x40] > fnlen) { rc = -EIO; break; }
       if (nnames >= 16) { rc = -ENOTSUP; break; }
       fn_rec_t *e = &names[nnames++];
       e->rec = recs[i];
