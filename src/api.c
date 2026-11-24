@@ -38,6 +38,7 @@ static int err_status(int rc) {
     case EROFS:   return 403;
     case ENOSPC:  return 507;
     case ENOTSUP: return 409;
+    case EBUSY:   return 409; /* the drive is being ejected */
     default:      return 500;
   }
 }
@@ -47,6 +48,7 @@ static const char *err_text(int rc) {
   if (rc == -EIO) return "I/O error (drive removed or file system damaged?)";
   if (rc == -EROFS) return "turn on writing for this drive first";
   if (rc == -EEXIST) return "something with that name already exists";
+  if (rc == -EBUSY) return "the drive is being ejected";
   return strerror(-rc);
 }
 
@@ -469,7 +471,8 @@ static void route_eject(http_req_t *r) {
   if (rc) {
     http_send_error(r, rc == -ENOENT ? 404 : rc == -EBUSY ? 409 : 500,
                     rc == -ENOENT ? "drive not found"
-                    : rc == -EBUSY ? "an upload or copy is still writing to this drive; wait for it to finish"
+                    : rc == -EBUSY ? "the drive is still being written to, or another eject is "
+                                     "under way; try again when that has finished"
                                    : "could not flush the drive");
     return;
   }
