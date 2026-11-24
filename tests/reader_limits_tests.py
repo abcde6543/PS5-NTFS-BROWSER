@@ -4,7 +4,8 @@ proportion to what is on them.
 
 Three hand-made cases, each changing a few fields of an ntfs-3g-made image:
 - an $ATTRIBUTE_LIST that names the same $DATA segment 64K times: every
-  entry appended the segment's runs again (hundreds of MB from 2 MB);
+  entry appended the segment's runs again (hundreds of MB from 2 MB); also
+  with the segment claiming highest VCN -1, so highest + 1 wraps to 0;
 - a folder index whose blocks all point at the next block from every entry:
   a chain of five blocks was walked about 30^4 times (max_visits comes from
   the index size the drive claims, which was raised too);
@@ -236,8 +237,10 @@ def bounded(name, img, *cmd):
           "%s, peak %d MB, %.1f s %s" % (status, peak >> 20, secs, out.strip()[-160:]))
 
 
-# 1. $ATTRIBUTE_LIST naming the same $DATA segment 64K times.
-def case_attrlist():
+# 1. $ATTRIBUTE_LIST naming the same $DATA segment 64K times. With wrap, the
+#    segment also claims highest VCN 0xFFFFFFFFFFFFFFFF (as an empty attribute
+#    does), so "highest + 1" wraps to 0 and can't serve as the progress check.
+def case_attrlist(wrap=False):
     im = Image(BASE)
     n = im.find("a.bin")
     rec = im.read(n)
@@ -255,6 +258,15 @@ def case_attrlist():
             break
         q += ln
     assert first, "no $DATA entry at VCN 0"
+    if wrap:
+        sref = struct.unpack_from("<Q", first, 16)[0] & 0xFFFFFFFFFFFF
+        inst = struct.unpack_from("<H", first, 24)[0]
+        srec = rec if sref == n else im.read(sref)
+        sp = [p for p, t, ln in im.attrs(srec) if t == AT_DATA and
+              struct.unpack_from("<H", srec, p + 14)[0] == inst][0]
+        struct.pack_into("<Q", srec, sp + 24, 0xFFFFFFFFFFFFFFFF)
+        if sref != n:
+            im.write(sref, srec)
     entry = first.ljust(32, b"\0")[:32]
     entry = entry[:4] + struct.pack("<H", 32) + entry[6:]
     count = 65536
@@ -272,9 +284,10 @@ def case_attrlist():
     a[0x40:0x40 + len(runl)] = runl
     replace_attr(rec, lp, a)
     im.write(n, rec)
-    path = os.path.join(WORK, "attrlist.img")
+    path = os.path.join(WORK, "attrlist%s.img" % ("-wrap" if wrap else ""))
     im.save(path)
-    bounded("attribute list repeating one segment 64K times", path, "cat", "/frag/a.bin")
+    bounded("attribute list repeating one segment 64K times" +
+            (", highest VCN -1" if wrap else ""), path, "cat", "/frag/a.bin")
 
 
 # 2. Index blocks chained so that every entry points at the next block.
@@ -375,6 +388,7 @@ def main():
     check("untouched folder lists 250 files", r.stdout.count("file_") == 250,
           "%d" % r.stdout.count("file_"))
     case_attrlist()
+    case_attrlist(wrap=True)
     case_index_chain()
     case_free_scan()
     if failures:

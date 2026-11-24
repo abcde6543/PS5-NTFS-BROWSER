@@ -412,13 +412,19 @@ int attr_find(ntfs_vol_t *v, uint64_t inode, uint32_t type,
       if (le32(seg) == type && le16(seg + 14) == inst &&
           attr_name_eq(seg, name, nlen)) {
         if (seg[8] && le64(seg + 16) != lowest) continue;
-        if (seg[8]) {
-          uint64_t highest = le64(seg + 24);
-          if (lowest != next_vcn || highest < lowest) { rc = -EIO; break; }
-          next_vcn = highest + 1;
-        }
-        rc = absorb(out, seg, le32(seg + 4), !found);
+        /* Progress is measured on the runs actually read, not on the
+         * segment's highest VCN: that is -1 for an empty attribute, so
+         * highest + 1 wraps to 0 and the same segment would pass again. */
+        int first_seg = !found;
+        if (seg[8] && lowest != next_vcn) { rc = -EIO; break; }
+        rc = absorb(out, seg, le32(seg + 4), first_seg);
         found = 1;
+        if (!rc && seg[8]) {
+          const run_t *last = out->nruns ? &out->runs[out->nruns - 1] : NULL;
+          uint64_t end = last ? (uint64_t)last->vcn + last->len : 0;
+          if (!first_seg && end <= next_vcn) rc = -EIO; /* added nothing */
+          next_vcn = end;
+        }
         break;
       }
     }
