@@ -348,6 +348,11 @@ int vfs_mount_path(const char *path, char *err, size_t errlen) {
 
 int vfs_unmount(const char *id) {
   int rc = -ENOENT;
+  /* g_scan first, in the same order as vfs_rescan(). Detaching while a scan
+   * runs, and marking the node rejected only after it, let that very scan
+   * find the node unmounted and not yet rejected and mount the drive again
+   * right after the user ejected it. */
+  pthread_mutex_lock(&g_scan);
   pthread_mutex_lock(&g_lock);
   for (int i = 0; i < MAX_VOLS; i++) {
     if (g_vols[i] && !strcmp(g_vols[i]->id, id)) {
@@ -364,7 +369,6 @@ int vfs_unmount(const char *id) {
       detach_locked(i);
       rc = 0;
       pthread_mutex_unlock(&g_lock);
-      pthread_mutex_lock(&g_scan);
       int found = 0;
       for (int p = 0; p < g_nprobed; p++)
         if (!strcmp(g_probed[p].path, node)) { g_probed[p].rejected = 1; found = 1; }
@@ -378,6 +382,7 @@ int vfs_unmount(const char *id) {
     }
   }
   pthread_mutex_unlock(&g_lock);
+  pthread_mutex_unlock(&g_scan);
   return rc;
 }
 
