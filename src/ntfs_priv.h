@@ -102,6 +102,7 @@ struct ntfs_vol {
   uint64_t alloc_hint;     /* next cluster to try when allocating */
   uint64_t mft_hint;       /* next MFT record to try */
   uint32_t mirr_recs;      /* records mirrored in $MFTMirr */
+  struct ntfs_wfile *wfiles; /* files open for writing (under lock) */
 };
 
 struct ntfs_file {
