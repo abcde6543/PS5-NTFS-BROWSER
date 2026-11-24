@@ -70,6 +70,7 @@ test: build/ntfstool-asan build/ntfs-browser build/ntfstool
 	python3 tests/write_tests.py build/ntfstool-asan
 	python3 tests/delete_tests.py build/ntfstool
 	python3 tests/test_server.py build/ntfs-browser
+	python3 tests/system_files_tests.py build/ntfs-browser
 
 VERSION := $(shell sed -n 's/.*APP_VERSION "\(.*\)".*/\1/p' src/api.h)
 

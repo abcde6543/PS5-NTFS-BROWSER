@@ -30,6 +30,7 @@
 
 static int prepare_locked(ntfs_vol_t *v);
 static int check_name(const char *name, uint16_t *out, int *nlen);
+static int in_extend(ntfs_vol_t *v, uint64_t ino);
 
 struct ntfs_wfile {
   ntfs_vol_t *v;
@@ -2187,7 +2188,7 @@ int ntfs_unlink(ntfs_vol_t *v, uint64_t parent, const char *name) {
   if (rc < 0) goto out;
   if (!f.ref) { rc = -ENOENT; goto out; }
   uint64_t ino = MREF(f.ref);
-  if (ino < 24) { rc = -EPERM; goto out; } /* system files, root */
+  if (ino < 24 || in_extend(v, parent)) { rc = -EPERM; goto out; } /* system files, root */
   rc = read_record(v, ino, rec);
   if (rc) goto out;
   if (le16(rec + MFT_HDR_SEQ) != MREF_SEQ(f.ref)) { rc = -EIO; goto out; }
@@ -2323,6 +2324,27 @@ static uint32_t make_fn(uint8_t *fn, uint64_t parent_ref, const uint16_t *name, 
 /* Common part of mkdir/create: returns the new record (unprotected) with
  * $STANDARD_INFORMATION, $FILE_NAME and $SECURITY_DESCRIPTOR, plus the key
  * for the parent's index. */
+#define INODE_EXTEND 11
+
+/* Is ino the $Extend folder or inside it? Its files ($ObjId, $Quota,
+ * $Reparse, $UsnJrnl, $RmMetadata and what is below them) are metadata that
+ * Windows needs, but their record numbers start at 24, past the ino < 24
+ * guard for system files. Follows the first name's parent up to the root.
+ * v->lock held. */
+static int in_extend(ntfs_vol_t *v, uint64_t ino) {
+  uint8_t *rec = malloc(v->rec_size);
+  int found = 0;
+  for (int depth = 0; rec && depth < 32 && ino != NTFS_ROOT_INODE; depth++) {
+    if (ino == INODE_EXTEND) { found = 1; break; }
+    if (read_record(v, ino, rec)) break;
+    const uint8_t *at = rec_attr(rec, v->rec_size, AT_FILE_NAME, NULL, 0);
+    if (!at || at[8] || le16(at + 20) + 8u > le32(at + 4)) break;
+    ino = MREF(le64(at + le16(at + 20)));
+  }
+  free(rec);
+  return found;
+}
+
 static int start_record(ntfs_vol_t *v, uint64_t parent, const uint16_t *name, int nlen,
                         int is_dir, uint64_t alloc, uint64_t size, int64_t mtime,
                         uint8_t *rec, uint8_t *key, uint32_t *klen, uint64_t *ino,
@@ -2335,6 +2357,7 @@ static int start_record(ntfs_vol_t *v, uint64_t parent, const uint16_t *name, in
   uint64_t parent_ref = parent | (uint64_t)le16(prec + MFT_HDR_SEQ) << 48;
   free(prec);
   if (rc) return rc;
+  if (in_extend(v, parent)) return -EPERM; /* nothing of ours among Windows' metadata */
 
   exist_ctx_t ex = {v, name, nlen, 0};
   rc = index_walk(v, parent, exist_cb, &ex);
