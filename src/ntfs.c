@@ -266,22 +266,47 @@ ssize_t attr_pread(ntfs_vol_t *v, attr_t *a, uint64_t off, void *out,
 
 /* ---- MFT records --------------------------------------------------------- */
 
+/* A record must agree with itself before anything trusts it: its sizes match
+ * the record size, its attributes end with the end marker inside the used
+ * part, and every attribute's name, value and run list lie inside the
+ * attribute. The writer moves and resizes attributes in place based on these
+ * fields, so a drive that lies about them would make it write outside its
+ * buffer. These are the checks ntfs-3g makes before using a record. */
+static int record_ok(const uint8_t *rec, uint32_t rec_size) {
+  uint32_t aoff = le16(rec + 0x14), used = le32(rec + 0x18);
+  if (le32(rec + 0x1C) != rec_size || used > rec_size || (aoff & 7) ||
+      aoff < le16(rec + 4) + 2u * le16(rec + 6))
+    return 0;
+  for (uint32_t p = aoff;;) {
+    if ((uint64_t)p + 4 > used) return 0; /* no end marker */
+    if (le32(rec + p) == AT_END) return 1;
+    if ((uint64_t)p + 8 > used) return 0;
+    const uint8_t *at = rec + p;
+    uint32_t len = le32(at + 4);
+    if (len < 24 || (len & 7) || len > used - p) return 0;
+    if (at[9] && le16(at + 10) + 2u * at[9] > len) return 0;
+    if (!at[8]) {
+      if ((uint64_t)le16(at + 20) + le32(at + 16) > len) return 0;
+    } else if (len < 0x40 || le16(at + 32) >= len) {
+      return 0;
+    }
+    p += len;
+  }
+}
+
 int read_record_any(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
   uint64_t off = inode * v->rec_size;
   if (off >= v->mft.size) return -ENOENT;
   ssize_t n = attr_pread(v, &v->mft, off, buf, v->rec_size);
   if (n != (ssize_t)v->rec_size) return -EIO;
   if (memcmp(buf, "FILE", 4) != 0) return -ENOENT;
-  return apply_fixups(buf, v->rec_size) ? -EIO : 0;
+  if (apply_fixups(buf, v->rec_size)) return -EIO;
+  return record_ok(buf, v->rec_size) ? 0 : -EIO;
 }
 
 int read_record(ntfs_vol_t *v, uint64_t inode, uint8_t *buf) {
-  uint64_t off = inode * v->rec_size;
-  if (off >= v->mft.size) return -ENOENT;
-  ssize_t n = attr_pread(v, &v->mft, off, buf, v->rec_size);
-  if (n != (ssize_t)v->rec_size) return -EIO;
-  if (memcmp(buf, "FILE", 4) != 0) return -ENOENT;
-  if (apply_fixups(buf, v->rec_size)) return -EIO;
+  int rc = read_record_any(v, inode, buf);
+  if (rc) return rc;
   if (!(le16(buf + 0x16) & MFT_IN_USE)) return -ENOENT;
   return 0;
 }

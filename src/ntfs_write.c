@@ -499,6 +499,8 @@ static int extend_mft(ntfs_vol_t *v) {
   if (!bat[8]) {
     uint32_t vlen = le32(bat + 16);
     if (need_bytes > vlen) {
+      /* A resident value can't outgrow the record; don't allocate for it. */
+      if (need_bytes > v->rec_size) { rc = -ENOSPC; goto undo; }
       uint8_t *val = calloc(1, (size_t)need_bytes);
       if (!val) { rc = -ENOMEM; goto undo; }
       memcpy(val, bat + le16(bat + 20), vlen);
@@ -615,7 +617,7 @@ static void release_record(ntfs_vol_t *v, uint64_t inode) {
     uint8_t *rec0 = malloc(v->rec_size);
     if (rec0 && read_record(v, INODE_MFT, rec0) == 0) {
       uint8_t *bat = rec_attr(rec0, v->rec_size, AT_BITMAP, NULL, 0);
-      if (bat && !bat[8]) {
+      if (bat && !bat[8] && inode / 8 < le32(bat + 16)) {
         bat[le16(bat + 20) + inode / 8] &= (uint8_t)~(1u << (inode % 8));
         write_record(v, INODE_MFT, rec0);
       }
@@ -700,6 +702,14 @@ static int node_parse(xnode_t *x, const uint8_t *p, const uint8_t *end) {
     uint32_t len = le16(p + 8);
     uint16_t flags = le16(p + 12);
     if (len < 16 || p + len > end || (len & 7)) return -EIO;
+    /* The sub-node VCN takes the last 8 bytes; every other entry carries a
+     * whole FILE_NAME key, which entry_cmp() and the collation read. */
+    uint32_t room = len - 16 - ((flags & IE_NODE) ? 8 : 0);
+    if ((flags & IE_NODE) && len < 24) return -EIO;
+    if (!(flags & IE_LAST)) {
+      uint32_t klen = le16(p + 10);
+      if (klen < 0x42 || klen > room || 0x42 + 2u * p[16 + 0x40] > klen) return -EIO;
+    }
     uint8_t *c = malloc(len);
     if (!c) return -ENOMEM;
     memcpy(c, p, len);
@@ -709,6 +719,24 @@ static int node_parse(xnode_t *x, const uint8_t *p, const uint8_t *end) {
     p += len;
   }
   return -EIO; /* no terminating entry */
+}
+
+/* $INDEX_ALLOCATION's sizes come from the drive; the index can't be larger
+ * than the volume (a bit flipped there made growing it ask for 4 GB). */
+static int alloc_fits(const ntfs_vol_t *v, const attr_t *a) {
+  uint64_t vol = v->total_clusters * (uint64_t)v->cluster;
+  return a->alloc <= vol && a->size <= a->alloc && a->init <= a->size;
+}
+
+/* $INDEX_ROOT's value: a 16-byte root header, then the node header, whose
+ * entries must end inside the value. (read_record() already checked that
+ * the value lies inside the attribute.) */
+static int root_value_ok(const uint8_t *ra) {
+  uint32_t vlen = le32(ra + 16);
+  const uint8_t *h = ra + le16(ra + 20) + 0x10;
+  if (vlen < 0x20) return 0;
+  uint32_t eo = le32(h), il = le32(h + 4);
+  return eo >= 0x10 && eo < il && il <= vlen - 0x10;
 }
 
 static uint32_t node_bytes(const xnode_t *x) {
@@ -1124,7 +1152,8 @@ static int grow_index_alloc_ext(ictx_t *c) {
   if (!rc && !bat) rc = -EIO;
   if (!rc && !bat[8]) {
     uint32_t vlen = le32(bat + 16);
-    if (need > vlen) {
+    if (need > vlen && need > v->rec_size) rc = -ENOSPC; /* can't stay resident */
+    else if (need > vlen) {
       uint8_t *val = calloc(1, (size_t)need);
       if (!val) rc = -ENOMEM;
       else {
@@ -1225,6 +1254,7 @@ static int grow_index_alloc(ictx_t *c) {
     uint64_t blocks = grown.size / c->ibs;
     uint32_t need = (uint32_t)((blocks + 63) / 64 * 8);
     if (!bat || bat[8]) rc = -ENOTSUP;
+    else if (le32(bat + 16) < need && need > v->rec_size) rc = -ENOSPC; /* can't stay resident */
     else if (le32(bat + 16) < need) {
       uint8_t *val = calloc(1, need);
       if (!val) rc = -ENOMEM;
@@ -1450,12 +1480,14 @@ static int index_insert(ntfs_vol_t *v, uint64_t dir, const uint8_t *key,
 
   uint8_t *ra = rec_attr(c.rec, v->rec_size, AT_INDEX_ROOT, I30, 4);
   if (!ra || ra[8]) { rc = -ENOTDIR; goto out; }
+  if (!root_value_ok(ra)) { rc = -EIO; goto out; }
   const uint8_t *rv = ra + le16(ra + 20);
   if (le32(rv) != AT_FILE_NAME || le32(rv + 4) != 1) { rc = -ENOTSUP; goto out; }
   c.ibs = le32(rv + 8);
   if (c.ibs < 512 || c.ibs > 65536) { rc = -EIO; goto out; }
   c.vcn_unit = v->cluster <= c.ibs ? v->cluster : 512;
   if (attr_find(v, dir, AT_INDEX_ALLOCATION, I30, 4, &c.alloc) == 0) c.has_alloc = 1;
+  if (c.has_alloc && !alloc_fits(v, &c.alloc)) { rc = -EIO; goto out; }
   idx_bitmap_load(&c);
 
   /* New entry. */
@@ -1613,12 +1645,14 @@ static int ictx_open(ntfs_vol_t *v, uint64_t dir, ictx_t *c, xnode_t *root) {
   }
   uint8_t *ra = rec_attr(c->rec, v->rec_size, AT_INDEX_ROOT, I30, 4);
   if (!ra || ra[8]) return -ENOTDIR;
+  if (!root_value_ok(ra)) return -EIO;
   const uint8_t *rv = ra + le16(ra + 20);
   if (le32(rv) != AT_FILE_NAME || le32(rv + 4) != 1) return -ENOTSUP;
   c->ibs = le32(rv + 8);
   if (c->ibs < 512 || c->ibs > 65536) return -EIO;
   c->vcn_unit = v->cluster <= c->ibs ? v->cluster : 512;
   if (attr_find(v, dir, AT_INDEX_ALLOCATION, I30, 4, &c->alloc) == 0) c->has_alloc = 1;
+  if (c->has_alloc && !alloc_fits(v, &c->alloc)) return -EIO;
   idx_bitmap_load(c);
   const uint8_t *h = rv + 0x10;
   uint32_t eo = le32(h), il = le32(h + 4);
@@ -2095,7 +2129,7 @@ static int inode_records(ntfs_vol_t *v, uint64_t ino, const uint8_t *base,
   attr_t a = {0};
   a.cu_idx = -1;
   int rc = absorb(&a, la, le32(la + 4), 1);
-  uint8_t *buf = NULL;
+  uint8_t *buf = NULL, *ext = NULL;
   if (!rc && a.size > 1024 * 1024) rc = -ENOTSUP;
   if (!rc && !(buf = malloc((size_t)a.size + 1))) rc = -ENOMEM;
   if (!rc && attr_pread(v, &a, 0, buf, (size_t)a.size) != (ssize_t)a.size) rc = -EIO;
@@ -2109,9 +2143,14 @@ static int inode_records(ntfs_vol_t *v, uint64_t ino, const uint8_t *base,
     for (int i = 0; i < *n; i++) if (recs[i] == r) seen = 1;
     if (!seen) {
       if (*n >= max) { rc = -ENOTSUP; break; }
+      /* Everything listed here gets freed: only accept records in use whose
+       * base reference names this file, never another file's records. */
+      if (!ext && !(ext = malloc(v->rec_size))) { rc = -ENOMEM; break; }
+      if (read_record(v, r, ext) || MREF(le64(ext + 0x20)) != ino) { rc = -EIO; break; }
       recs[(*n)++] = r;
     }
   }
+  free(ext);
   free(buf);
   attr_free(&a);
   return rc;
@@ -2214,6 +2253,8 @@ int ntfs_unlink(ntfs_vol_t *v, uint64_t parent, const char *name) {
       if (t == 0x40 || t == 0xC0) { rc = -ENOTSUP; break; }
       if (t != AT_FILE_NAME || at[8]) continue;
       const uint8_t *fn = at + le16(at + 20);
+      uint32_t fnlen = le32(at + 16); /* inside the attribute: read_record() */
+      if (fnlen < 0x42 || 0x42 + 2u * fn[0x40] > fnlen) { rc = -EIO; break; }
       if (nnames >= 16) { rc = -ENOTSUP; break; }
       fn_rec_t *e = &names[nnames++];
       e->rec = recs[i];
