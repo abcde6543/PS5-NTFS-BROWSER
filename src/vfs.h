@@ -25,6 +25,8 @@ typedef struct vol {
   ntfs_vol_t *ntfs;
   int         refs;
   int         detached;      /* removed; freed when the last user is done */
+  int         writers;       /* open write handles (uploads, copies); atomic */
+  int         closing;       /* eject under way: no new writers; atomic */
 } vol_t;
 
 typedef struct ventry {
@@ -70,7 +72,8 @@ int vfs_unmount(const char *id);
 /* Whether newly found clean NTFS drives allow writing straight away. */
 void vfs_set_default_writable(int on);
 
-/* Flush an NTFS volume and unmount it so the drive can be unplugged. */
+/* Flush an NTFS volume and unmount it so the drive can be unplugged.
+ * -EBUSY while an upload or copy still has a file open for writing. */
 int vfs_eject(const char *id);
 
 /* Find entries whose name contains query (case-insensitive for ASCII) in
@@ -113,13 +116,15 @@ typedef struct vwfile {
   int           fd;
   ntfs_wfile_t *nw;
   int64_t       mtime;
+  int           counted;     /* holds a slot in vol->writers */
   char          tmp[1100], final[1100];
 } vwfile_t;
 
 /* Open path for writing a file of exactly size bytes. If the same file was
  * partly written before, *done says how much is there already (writing
  * continues from it); *done == size means it is already complete.
- * -EEXIST if a different file has that name. */
+ * -EEXIST if a different file has that name, -EBUSY if the drive is being
+ * ejected. Every successful vfs_wopen() must be followed by vfs_wclose(). */
 int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
               vwfile_t *w, uint64_t *done);
 int vfs_wwrite(vwfile_t *w, const void *buf, size_t len);

@@ -574,12 +574,32 @@ static int ntfs_parent(vol_t *v, const char *path, uint64_t *parent, char *name,
   return ntfs_lookup(v->ntfs, dl ? dir : "/", parent);
 }
 
+/* Every write to a drive is bracketed by write_begin()/write_end(), so that
+ * vfs_eject() can tell when it is still unsafe to unplug it. The writer
+ * registers first and then looks at `closing`; the eject sets `closing` first
+ * and then looks at the count. With sequentially consistent atomics at least
+ * one side sees the other. Once an eject has succeeded, `closing` stays set,
+ * so a job or request that still holds the volume can't write to it. */
+static int write_begin(vol_t *v) {
+  __atomic_add_fetch(&v->writers, 1, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&v->closing, __ATOMIC_SEQ_CST)) return 0;
+  __atomic_sub_fetch(&v->writers, 1, __ATOMIC_SEQ_CST);
+  return -EBUSY;
+}
+
+static void write_end(vol_t *v) {
+  __atomic_sub_fetch(&v->writers, 1, __ATOMIC_SEQ_CST);
+}
+
 int vfs_mkdir(vol_t *v, const char *path) {
   if (v->kind == VOL_NTFS) {
     uint64_t parent;
     char name[512];
-    int rc = ntfs_parent(v, path, &parent, name, sizeof name);
+    int rc = write_begin(v);
+    if (rc) return rc;
+    rc = ntfs_parent(v, path, &parent, name, sizeof name);
     if (!rc) rc = ntfs_mkdir(v->ntfs, parent, name, (int64_t)time(NULL), NULL);
+    write_end(v);
     return rc;
   }
   return mkdir(path, 0777) ? -errno : 0;
@@ -613,8 +633,8 @@ int64_t vfs_free_bytes(vol_t *v, const char *path) {
   return (int64_t)((uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize);
 }
 
-int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
-              vwfile_t *w, uint64_t *done) {
+static int wopen_inner(vol_t *v, const char *path, uint64_t size, int64_t mtime,
+                       vwfile_t *w, uint64_t *done) {
   memset(w, 0, sizeof *w);
   w->vol = v;
   w->fd = -1;
@@ -661,6 +681,20 @@ int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
   return w->fd < 0 ? -errno : 0;
 }
 
+/* An open write handle holds its writer slot until vfs_wclose(). */
+int vfs_wopen(vol_t *v, const char *path, uint64_t size, int64_t mtime,
+              vwfile_t *w, uint64_t *done) {
+  int rc = write_begin(v);
+  if (rc) {
+    memset(w, 0, sizeof *w);
+    return rc;
+  }
+  rc = wopen_inner(v, path, size, mtime, w, done);
+  if (rc) write_end(v);
+  else w->counted = 1;
+  return rc;
+}
+
 int vfs_wwrite(vwfile_t *w, const void *buf, size_t len) {
   if (w->nw) return ntfs_wwrite(w->nw, buf, len);
   const uint8_t *p = buf;
@@ -676,7 +710,7 @@ int vfs_wwrite(vwfile_t *w, const void *buf, size_t len) {
   return 0;
 }
 
-int vfs_wclose(vwfile_t *w, int ok) {
+static int wclose_inner(vwfile_t *w, int ok) {
   int rc = 0;
   if (w->nw) {
     rc = ntfs_wclose(w->nw);
@@ -702,6 +736,15 @@ int vfs_wclose(vwfile_t *w, int ok) {
   return 0;
 }
 
+int vfs_wclose(vwfile_t *w, int ok) {
+  int rc = wclose_inner(w, ok);
+  if (w->counted) {
+    w->counted = 0;
+    write_end(w->vol);
+  }
+  return rc;
+}
+
 /* ---- Eject & search ------------------------------------------------------ */
 
 int vfs_eject(const char *id) {
@@ -710,10 +753,24 @@ int vfs_eject(const char *id) {
     vfs_put(v);
     return -ENOENT;
   }
+  /* "Safe to unplug" must not be said while anything is still writing (see
+   * write_begin for the handshake). A second eject while one is under way is
+   * refused without touching `closing`: only the eject that set it may clear
+   * it again, or a writer could slip in while the first one flushes. */
+  if (__atomic_exchange_n(&v->closing, 1, __ATOMIC_SEQ_CST)) {
+    vfs_put(v);
+    return -EBUSY;
+  }
+  if (__atomic_load_n(&v->writers, __ATOMIC_SEQ_CST) > 0) {
+    __atomic_store_n(&v->closing, 0, __ATOMIC_SEQ_CST);
+    vfs_put(v);
+    return -EBUSY;
+  }
   int rc = ntfs_sync(v->ntfs);
+  if (!rc) rc = vfs_unmount(id);
+  if (rc) __atomic_store_n(&v->closing, 0, __ATOMIC_SEQ_CST);
   vfs_put(v);
-  if (rc) return rc;
-  return vfs_unmount(id);
+  return rc;
 }
 
 typedef struct sctx {
@@ -832,11 +889,14 @@ int vfs_wcheck(vol_t *v, const char *path, uint64_t size, int64_t mtime, uint64_
     int rc = ntfs_stat(v->ntfs, ino, &st);
     if (rc) return rc;
     if (st.is_dir || st.size != size) return -EEXIST;
+    /* opening for writing can already write (it clears the journal) */
     ntfs_wfile_t *w;
+    if ((rc = write_begin(v))) return rc;
     rc = ntfs_wopen(v->ntfs, ino, &w, done);
+    if (!rc) ntfs_wclose(w);
+    write_end(v);
     if (rc == -ENOTSUP) { *done = size; return 0; }
     if (rc) return rc;
-    ntfs_wclose(w);
     if (*done < size && mtime > 0 && st.mtime != mtime) { *done = 0; return -EEXIST; }
     return 0;
   }
@@ -852,6 +912,10 @@ int vfs_delete(vol_t *v, const char *path) {
   if (v->kind != VOL_NTFS) return -ENOTSUP;
   uint64_t parent;
   char name[512];
-  int rc = ntfs_parent(v, path, &parent, name, sizeof name);
-  return rc ? rc : ntfs_unlink(v->ntfs, parent, name);
+  int rc = write_begin(v);
+  if (rc) return rc;
+  rc = ntfs_parent(v, path, &parent, name, sizeof name);
+  if (!rc) rc = ntfs_unlink(v->ntfs, parent, name);
+  write_end(v);
+  return rc;
 }
