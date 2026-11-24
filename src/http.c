@@ -12,11 +12,17 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "utf.h"
 
 #define MAX_CLIENTS 64
+/* A connection that makes no progress for this long, in either direction,
+ * is closed: a request head must arrive within it as a whole, and a send
+ * that the client doesn't take (a stalled or paused download) gives up after
+ * it. Otherwise 64 such connections hold every slot, and a stalled download
+ * keeps its drive referenced, for as long as the client likes. */
 #define IDLE_TIMEOUT_SEC 30
 
 /* ---- Growable buffer ----------------------------------------------------- */
@@ -170,10 +176,15 @@ static int read_request(http_req_t *r, char *carry, size_t *carry_len) {
   size_t len = *carry_len;
   memcpy(r->raw, carry, len);
   char *hend = NULL;
+  time_t deadline = 0; /* set once the head has started to arrive */
   for (;;) {
     r->raw[len] = 0;
     if ((hend = strstr(r->raw, "\r\n\r\n"))) break;
     if (len >= sizeof r->raw - 1) return -1;
+    /* SO_RCVTIMEO bounds each recv(); this bounds the whole head, so a
+     * client can't keep the slot by sending a byte every 29 s. */
+    if (len && !deadline) deadline = time(NULL) + IDLE_TIMEOUT_SEC;
+    if (deadline && time(NULL) > deadline) return -1;
     ssize_t n = recv(r->fd, r->raw + len, sizeof r->raw - 1 - len, 0);
     if (n <= 0) return -1;
     len += (size_t)n;
@@ -439,6 +450,7 @@ void http_run(int s, http_handler h) {
 
     struct timeval tv = {IDLE_TIMEOUT_SEC, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
