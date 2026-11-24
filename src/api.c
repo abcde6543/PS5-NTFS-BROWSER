@@ -38,6 +38,7 @@ static int err_status(int rc) {
     case EROFS:   return 403;
     case ENOSPC:  return 507;
     case ENOTSUP: return 409;
+    case ETXTBSY: return 409; /* another upload or copy is writing the file */
     default:      return 500;
   }
 }
@@ -47,6 +48,8 @@ static const char *err_text(int rc) {
   if (rc == -EIO) return "I/O error (drive removed or file system damaged?)";
   if (rc == -EROFS) return "turn on writing for this drive first";
   if (rc == -EEXIST) return "something with that name already exists";
+  if (rc == -ETXTBSY) return "this file is still being written by another upload or copy; "
+                             "try again when it has finished";
   return strerror(-rc);
 }
 

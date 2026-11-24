@@ -33,6 +33,7 @@ static int check_name(const char *name, uint16_t *out, int *nlen);
 
 struct ntfs_wfile {
   ntfs_vol_t *v;
+  struct ntfs_wfile *next; /* in v->wfiles */
   uint64_t    inode;
   attr_t      a;       /* runs of the unnamed $DATA */
   uint64_t    pos;     /* bytes written = initialized size */
@@ -51,6 +52,30 @@ static const uint8_t SD_DEFAULT[80] = {
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
 
 /* ---- Small helpers ------------------------------------------------------- */
+
+/* Files open for writing, so that a file is never written through two
+ * handles at once (the older handle's close would store its own, smaller
+ * initialized size over the newer data) and is never deleted while a handle
+ * still writes into clusters that may by then belong to another file.
+ * All three take v->lock held. */
+static int wfile_busy(const ntfs_vol_t *v, uint64_t inode) {
+  for (const ntfs_wfile_t *w = v->wfiles; w; w = w->next)
+    if (w->inode == inode) return 1;
+  return 0;
+}
+
+static void wfile_add(ntfs_vol_t *v, ntfs_wfile_t *f) {
+  f->next = v->wfiles;
+  v->wfiles = f;
+}
+
+static void wfile_del(ntfs_vol_t *v, ntfs_wfile_t *f) {
+  for (ntfs_wfile_t **p = &v->wfiles; *p; p = &(*p)->next)
+    if (*p == f) {
+      *p = f->next;
+      return;
+    }
+}
 
 static inline uint32_t align8(uint32_t x) { return (x + 7) & ~7u; }
 
@@ -2188,6 +2213,7 @@ int ntfs_unlink(ntfs_vol_t *v, uint64_t parent, const char *name) {
   if (!f.ref) { rc = -ENOENT; goto out; }
   uint64_t ino = MREF(f.ref);
   if (ino < 24) { rc = -EPERM; goto out; } /* system files, root */
+  if (wfile_busy(v, ino)) { rc = -ETXTBSY; goto out; }
   rc = read_record(v, ino, rec);
   if (rc) goto out;
   if (le16(rec + MFT_HDR_SEQ) != MREF_SEQ(f.ref)) { rc = -EIO; goto out; }
@@ -2477,14 +2503,17 @@ int ntfs_create(ntfs_vol_t *v, uint64_t parent, const char *name, uint64_t size,
   }
   if (rc && clusters) free_clusters(v, &f->a);
   free(rec);
+  if (!rc) {
+    f->v = v;
+    f->inode = ino;
+    wfile_add(v, f);
+  }
   pthread_mutex_unlock(&v->lock);
   if (rc) {
     attr_free(&f->a);
     free(f);
     return rc;
   }
-  f->v = v;
-  f->inode = ino;
   *out = f;
   return 0;
 }
@@ -2494,6 +2523,7 @@ int ntfs_wopen(ntfs_vol_t *v, uint64_t inode, ntfs_wfile_t **out, uint64_t *done
   if (!f) return -ENOMEM;
   pthread_mutex_lock(&v->lock);
   int rc = v->rw && !prepare_locked(v) ? attr_find(v, inode, AT_DATA, NULL, 0, &f->a) : -EROFS;
+  if (!rc && wfile_busy(v, inode)) rc = -ETXTBSY;
   if (!rc && (f->a.flags & (ATTR_COMPRESSED | ATTR_ENCRYPTED | ATTR_SPARSE)))
     rc = -ENOTSUP;
   if (!rc && f->a.resident && f->a.size) rc = -ENOTSUP;
@@ -2504,10 +2534,13 @@ int ntfs_wopen(ntfs_vol_t *v, uint64_t inode, ntfs_wfile_t **out, uint64_t *done
       if (f->a.runs[i].lcn >= 0) have += f->a.runs[i].len;
     if (have < need) rc = -ENOTSUP;
   }
+  if (!rc) {
+    f->v = v;
+    f->inode = inode;
+    wfile_add(v, f);
+  }
   pthread_mutex_unlock(&v->lock);
   if (rc) { attr_free(&f->a); free(f); return rc; }
-  f->v = v;
-  f->inode = inode;
   f->pos = f->flushed = f->a.resident ? 0 : f->a.init;
   *done = f->a.resident ? f->a.size : f->pos;
   *out = f;
@@ -2555,6 +2588,7 @@ int ntfs_wclose(ntfs_wfile_t *f) {
   bdev_flush(v->dev);
   int rc = store_init(f);
   bdev_flush(v->dev);
+  wfile_del(v, f);
   pthread_mutex_unlock(&v->lock);
   attr_free(&f->a);
   free(f);

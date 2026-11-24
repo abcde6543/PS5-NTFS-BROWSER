@@ -231,6 +231,7 @@ static const char *delete_error(int rc) {
     case EPERM:     return "system files can't be deleted";
     case ENOTEMPTY: return "folder not empty";
     case EROFS:     return "the drive is read-only";
+    case ETXTBSY:   return "an upload or copy is still writing this file";
     default:        return NULL;
   }
 }
