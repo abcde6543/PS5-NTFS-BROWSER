@@ -585,10 +585,30 @@ int vfs_mkdir(vol_t *v, const char *path) {
   return mkdir(path, 0777) ? -errno : 0;
 }
 
+/* A name Windows can use: vfs_safe_name() would leave it as it is. */
+static int windows_name_ok(const char *name) {
+  char safe[1024];
+  vfs_safe_name(safe, sizeof safe, name);
+  return !strcmp(safe, name);
+}
+
 int vfs_mkdirs(vol_t *v, const char *path) {
   char tmp[1024];
   snprintf(tmp, sizeof tmp, "%s", path);
   size_t n = strlen(tmp);
+  /* Uploads and copied files get Windows-safe names (vfs_safe_name());
+   * folders typed in by hand must not slip past that: Explorer can't open or
+   * delete "CON", "a:b" or "name." on an NTFS drive. Check every folder that
+   * would be created before creating any of them. */
+  for (size_t i = 1; v->kind == VOL_NTFS && i <= n; i++) {
+    if (tmp[i] != '/' && tmp[i] != 0) continue;
+    char c = tmp[i];
+    tmp[i] = 0;
+    ventry_t st;
+    int bad = vfs_stat(v, tmp, &st) == -ENOENT && !windows_name_ok(strrchr(tmp, '/') + 1);
+    tmp[i] = c;
+    if (bad) return -EILSEQ;
+  }
   for (size_t i = 1; i <= n; i++) {
     if (tmp[i] != '/' && tmp[i] != 0) continue;
     char c = tmp[i];
@@ -797,10 +817,14 @@ int vfs_search(vol_t *v, const char *path, const char *query, size_t max, vlist_
  * exFAT/FAT USB drives): no \\ : * ? " < > |, no control characters, no
  * trailing dot or space, and not a reserved device name such as CON. */
 void vfs_safe_name(char *dst, size_t len, const char *src) {
-  static const char *reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
+  /* Windows' reserved device names, including COM0/LPT0 and the ones with
+   * superscript digits (UTF-8 C2 B9, C2 B2, C2 B3). */
+  static const char *reserved[] = {"CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3",
                                    "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-                                   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-                                   "LPT7", "LPT8", "LPT9"};
+                                   "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                                   "LPT7", "LPT8", "LPT9",
+                                   "COM\xC2\xB9", "COM\xC2\xB2", "COM\xC2\xB3",
+                                   "LPT\xC2\xB9", "LPT\xC2\xB2", "LPT\xC2\xB3"};
   char tmp[1024];
   snprintf(tmp, sizeof tmp, "%s", src);
   for (char *p = tmp; *p; p++)

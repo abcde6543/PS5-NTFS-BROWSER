@@ -34,6 +34,7 @@ static int err_status(int rc) {
     case EACCES:  return 403;
     case EPERM:   return 403;
     case EINVAL:  return 400;
+    case EILSEQ:  return 400;
     case EEXIST:  return 409;
     case EROFS:   return 403;
     case ENOSPC:  return 507;
@@ -47,6 +48,8 @@ static const char *err_text(int rc) {
   if (rc == -EIO) return "I/O error (drive removed or file system damaged?)";
   if (rc == -EROFS) return "turn on writing for this drive first";
   if (rc == -EEXIST) return "something with that name already exists";
+  if (rc == -EILSEQ) return "Windows can't use that name (no \\ : * ? \" < > |, no dot or "
+                            "space at the end, not a device name such as CON)";
   return strerror(-rc);
 }
 
@@ -379,7 +382,7 @@ static void route_copy(http_req_t *r) {
   vfs_put(dv);
   if (rc) {
     if (rc == -EROFS) snprintf(err, sizeof err, "turn on writing for this drive first");
-    else snprintf(err, sizeof err, "cannot create %s: %s", dest, strerror(-rc));
+    else snprintf(err, sizeof err, "cannot create %s: %s", dest, err_text(rc));
     http_send_error(r, rc == -EROFS ? 403 : 400, err);
     return;
   }
