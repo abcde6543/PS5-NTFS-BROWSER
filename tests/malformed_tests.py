@@ -47,6 +47,11 @@ def build_base():
         os.makedirs(os.path.join(MNT, "folder"))
         with open(os.path.join(MNT, "folder", "inside.txt"), "w") as f:
             f.write("inside\n")
+        comp = os.path.join(MNT, "comp")              # compressed folder (as in fuzz.py)
+        os.makedirs(comp)
+        sh("setfattr", "-n", "system.ntfs_attrib_be", "-v", "0x00000810", comp)
+        with open(os.path.join(comp, "packed.txt"), "wb") as f:
+            f.write(b"compress me " * 30000)
     finally:
         sh("umount", MNT)
 
@@ -211,6 +216,26 @@ def patch_vlen(im, rec):
     struct.pack_into("<I", rec, p + 16, 0xFFFFFFF0)
 
 
+# 6. A compressed file whose compression unit is 2^40 clusters: the shift is
+#    undefined, and every unit from 18 up asks for 1 GB or more per read.
+def patch_cu(im, rec):
+    attrs, _ = im.attrs(rec)
+    p, _, _ = [a for a in attrs if a[1] == AT_DATA][0]
+    assert rec[p + 8] == 1 and struct.unpack_from("<H", rec, p + 12)[0] & 1,         "packed.txt must be compressed"
+    rec[p + 34] = 40
+
+
+def case_boot(name, offset, value, *cmds):
+    """Patch one byte of the boot sector."""
+    im = Image(BASE)
+    im.data[offset] = value
+    path = os.path.join(WORK, "case.img")
+    im.save(path)
+    for cmd in cmds:
+        status, rc, out, err = run(path, *cmd)
+        check("%s (%s)" % (name, " ".join(cmd)), status, err.strip().splitlines()[:6] if err else "")
+
+
 def main():
     build_base()
     # Sanity: the untouched image works.
@@ -221,6 +246,11 @@ def main():
     case("resident length wraps, value read past record", "res.txt", patch_resident, ("cat", "/res.txt"))
     case("attribute name offset outside the record", "folder", patch_nameoff, ("ls", "/folder"))
     case("resident value length wraps 2^32", "small.txt", patch_vlen, ("cat", "/small.txt"))
+    case("compression unit of 2^40 clusters", "packed.txt", patch_cu, ("cat", "/comp/packed.txt"))
+    # 7.-9. Boot sector sizes given as powers of two with absurd exponents.
+    case_boot("sectors per cluster 2^106", 0x0D, 0x96, ("ls", "/"))
+    case_boot("MFT record size 2^102", 0x40, 0x9A, ("ls", "/"))
+    case_boot("index block size 2^102", 0x44, 0x9A, ("ls", "/"))
     if failures:
         print("\nFAILED: " + ", ".join(failures))
         sys.exit(1)

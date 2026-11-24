@@ -347,6 +347,10 @@ int absorb(attr_t *a, const uint8_t *at, uint32_t at_len, int first) {
     a->size = le64(at + 48);
     a->init = le64(at + 56);
     uint8_t cu = at[34];
+    /* Windows only uses 16-cluster units (cu 4); a larger one would make
+     * every read allocate 2^cu clusters (1 GB at cu 18 with 4 KiB clusters),
+     * and above 31 the shift is undefined. */
+    if ((a->flags & ATTR_COMPRESSED) && cu > 4) return -EIO;
     if ((a->flags & ATTR_COMPRESSED) && cu) a->cu_clusters = 1u << cu;
     if (a->init > a->size) a->init = a->size;
   }
@@ -770,14 +774,16 @@ int ntfs_mount(bdev_t *b, ntfs_vol_t **out, char *err, size_t errlen) {
 
   uint32_t bps = le16(bs + 0x0B);
   uint8_t spc_raw = bs[0x0D];
-  uint32_t spc = spc_raw <= 0x80 ? spc_raw : 1u << (256 - spc_raw);
+  /* 0x81..0xFF encode 2^(256 - x) sectors; beyond 2^31 the shift itself is
+   * undefined (spc 0 is refused below) */
+  uint32_t spc = spc_raw <= 0x80 ? spc_raw : 256 - spc_raw <= 31 ? 1u << (256 - spc_raw) : 0;
   if (bps < 256 || bps > 4096 || (bps & (bps - 1)) || !spc || (spc & (spc - 1)))
     FAIL("bad boot sector geometry");
   v->cluster = bps * spc;
   if (v->cluster > 2u * 1024 * 1024) FAIL("unsupported cluster size");
 
   int8_t cpr = (int8_t)bs[0x40];
-  v->rec_size = cpr > 0 ? (uint32_t)cpr * v->cluster : 1u << -cpr;
+  v->rec_size = cpr > 0 ? (uint32_t)cpr * v->cluster : -cpr <= 31 ? 1u << -cpr : 0;
   if (v->rec_size < 1024 || v->rec_size > 65536 || (v->rec_size & 511))
     FAIL("bad MFT record size");
 
@@ -790,7 +796,7 @@ int ntfs_mount(bdev_t *b, ntfs_vol_t **out, char *err, size_t errlen) {
   v->mftmirr_lcn = le64(bs + 0x38);
   v->sector = bps;
   int8_t cpi = (int8_t)bs[0x44];
-  v->idx_size = cpi > 0 ? (uint32_t)cpi * v->cluster : 1u << -cpi;
+  v->idx_size = cpi > 0 ? (uint32_t)cpi * v->cluster : -cpi <= 31 ? 1u << -cpi : 0;
   if (v->idx_size < 512 || v->idx_size > 65536) v->idx_size = 4096;
 
   /* Bootstrap: read $MFT's own record straight from disk. */
