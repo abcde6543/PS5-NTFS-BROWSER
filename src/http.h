@@ -51,6 +51,14 @@ void http_run(int listen_fd, http_handler h);
 /* Fetch a decoded query parameter into out. Returns 1 if present. */
 int http_param(const http_req_t *r, const char *name, char *out, size_t outlen);
 
+/* The largest decoded query parameter value, terminating NUL included, that
+ * the handlers accept: their path and file name buffers have this size. */
+#define HTTP_PARAM_MAX 1024
+
+/* 1 if every query parameter decodes (no NUL bytes) and fits into an
+ * HTTP_PARAM_MAX buffer, so no handler works on a value cut short. */
+int http_query_ok(const http_req_t *r);
+
 /* Read up to len bytes of the request body. Returns the count, 0 at the end
  * of the body, or -1 on error. Unread body bytes are discarded after the
  * handler returns (or the connection is closed if there are many). */

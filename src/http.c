@@ -138,6 +138,22 @@ int http_param(const http_req_t *r, const char *name, char *out, size_t outlen) 
   return 0;
 }
 
+int http_query_ok(const http_req_t *r) {
+  if (!r->query) return 1;
+  char tmp[HTTP_PARAM_MAX];
+  const char *p = r->query;
+  while (*p) {
+    const char *amp = strchr(p, '&');
+    size_t seg = amp ? (size_t)(amp - p) : strlen(p);
+    const char *eq = memchr(p, '=', seg);
+    if (eq && url_decode(eq + 1, seg - (size_t)(eq - p) - 1, tmp, sizeof tmp, 1))
+      return 0;
+    p += seg;
+    if (*p == '&') p++;
+  }
+  return 1;
+}
+
 static void parse_range(http_req_t *r, const char *v) {
   while (*v == ' ') v++;
   if (strncasecmp(v, "bytes=", 6)) return;
@@ -255,6 +271,7 @@ const char *http_status_text(int s) {
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 414: return "URI Too Long";
     case 416: return "Range Not Satisfiable";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";

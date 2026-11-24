@@ -477,7 +477,9 @@ static void route_eject(http_req_t *r) {
 /* Upload: the request body is the file. ?vol=&path=<folder>&name=&mtime= */
 static void route_upload(http_req_t *r) {
   if (require_post(r)) return;
-  char dir[1024], raw_name[512] = "", name[512], mt[32] = "", full[1600];
+  /* name: an NTFS name is up to 255 UTF-16 units, which is up to 765 bytes */
+  char dir[1024], raw_name[HTTP_PARAM_MAX] = "", name[HTTP_PARAM_MAX], mt[32] = "";
+  char full[sizeof dir + sizeof name];
   vol_t *v = get_vol_path(r, dir, sizeof dir);
   if (!v) return;
   http_param(r, "name", raw_name, sizeof raw_name);
@@ -637,6 +639,14 @@ void api_handle(http_req_t *r) {
       {"/api/jobs/cancel", route_cancel},
       {"/api/jobs/clear", route_clear},
   };
+  /* The handlers copy parameters into fixed buffers, and a value that does
+   * not fit (or holds a %00) would be cut short and still be used: a file
+   * path cut right after a '/' names its folder, so deleting the file would
+   * delete the folder. Refuse such requests before any handler runs. */
+  if (!http_query_ok(r)) {
+    http_send_error(r, 414, "a parameter is too long or contains a NUL byte");
+    return;
+  }
   for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
     if (!strcmp(r->path, routes[i].path)) {
       routes[i].fn(r);
